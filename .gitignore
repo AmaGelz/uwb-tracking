@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Local scratch data (the app itself is stateless; everything lives in Postgres)
+data/local/*.db
+
+# Secrets — .env files here currently hold real Supabase credentials for this
+# project. Keep them out of version control; share them out of band instead.
+.env
+backend/.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

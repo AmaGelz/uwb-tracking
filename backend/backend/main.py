@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+import calculations
+import positioning
+import queries as q
+import tracking
+from config import settings
+from db import db, init_db, seed_demo_data
+from security import create_token, password_verify, public_user
+from simulator import simulator
+from utils import utc_now
+
+app = FastAPI(
+    title=settings.app_name,
+    version="2.0.0",
+    description="Backend API for the SUPALAI UWB tracking dashboard.",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------
+
+class SignInRequest(BaseModel):
+    email: str
+    password: str
+
+
+class GoogleSignInRequest(BaseModel):
+    credential: str
+
+
+class ProjectCreate(BaseModel):
+    project_id: str
+    name: str
+    province: str = ""
+    plan_id: str = ""
+    plan_name: str = ""
+    width_m: float = 20.0
+    height_m: float = 20.0
+
+
+class AnchorCreate(BaseModel):
+    anchor_id: str
+    x: float
+    y: float
+    battery: float | None = None
+
+
+class VisitMeta(BaseModel):
+    visit_key: str
+    customer_id: str = ""
+    deal_status: str = ""
+
+
+class NoteCreate(BaseModel):
+    visit_key: str
+    body: str = Field(min_length=1, max_length=2000)
+
+
+class RangeMeasurement(BaseModel):
+    anchor_id: str
+    distance_m: float
+
+
+class PositioningIngest(BaseModel):
+    tag_id: str
+    ranges: list[RangeMeasurement]
+
+
+# ---------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------
+
+def current_user(x_session: str | None) -> dict[str, Any] | None:
+    if not x_session:
+        return None
+    user_id = q.get_session_user(x_session)
+    if not user_id:
+        return None
+    return q.get_user_by_id(user_id)
+
+
+def require_user(x_session: str | None) -> dict[str, Any]:
+    user = current_user(x_session)
+    if not user:
+        raise HTTPException(status_code=401, detail="กรุณาเข้าสู่ระบบ")
+    return user
+
+
+def require_role(x_session: str | None, roles: set[str]) -> dict[str, Any]:
+    user = require_user(x_session)
+    if user["role"] not in roles:
+        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงข้อมูลนี้")
+    return user
+
+
+def _query_params(province, project, plan, employee, customer, from_date, to_date) -> dict[str, str]:
+    return {
+        "province": province or "", "project": project or "", "plan": plan or "",
+        "employee": employee or "", "customer": customer or "",
+        "from": from_date or "", "to": to_date or "",
+    }
+
+
+# ---------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup() -> None:
+    init_db()
+    seed_demo_data()
+    if settings.simulator_enabled:
+        simulator.start()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    simulator.stop()
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "service": "supalai-tracking-api",
+        "database": "postgres",
+        "simulator": settings.simulator_enabled,
+        "time": utc_now().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------
+
+@app.get("/api/auth/google-config")
+def google_config():
+    enabled = bool(settings.google_client_id)
+    return {"enabled": enabled, "client_id": settings.google_client_id if enabled else None}
+
+
+@app.post("/api/signin")
+def signin(payload: SignInRequest):
+    user = q.get_user_by_email(payload.email.strip().lower())
+    if not user or not password_verify(payload.password, user["password_hash"]):
+        return {"ok": False, "error": "Email หรือ Password ไม่ถูกต้อง"}
+    token = create_token(user["id"])
+    return {"ok": True, "token": token, "user": public_user(user)}
+
+
+@app.post("/api/signout")
+def signout(x_session: str | None = Header(default=None)):
+    if x_session:
+        q.delete_session(x_session)
+    return {"ok": True}
+
+
+@app.post("/api/google-signin")
+def google_signin(payload: GoogleSignInRequest):
+    if not settings.google_client_id:
+        return {"ok": False, "error": "Google Sign-In ยังไม่ได้ตั้งค่าใน .env"}
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+
+        info = id_token.verify_oauth2_token(payload.credential, google_requests.Request(), settings.google_client_id)
+        email = str(info.get("email", "")).lower().strip()
+        if not email:
+            return {"ok": False, "error": "Google ไม่ส่ง email กลับมา"}
+
+        user = q.get_user_by_email(email)
+        if not user:
+            return {"ok": False, "error": "ไม่พบ email นี้ในระบบ SUPALAI"}
+
+        token = create_token(user["id"])
+        return {"ok": True, "token": token, "user": public_user(user)}
+    except ImportError:
+        return {"ok": False, "error": "ยังไม่ได้ติดตั้ง google-auth"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Google authentication failed: {exc}"}
+
+
+@app.get("/api/me")
+def me(x_session: str | None = Header(default=None)):
+    """Restores the session after a page refresh / direct navigation.
+
+    Without this endpoint the frontend's route() guard (which calls it on
+    every navigation when S.user isn't already in memory) always fails and
+    bounces the person back to login.html, even with a valid token.
+    """
+    user = require_user(x_session)
+    return {"ok": True, "user": public_user(user)}
+
+
+# ---------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------
+
+@app.get("/api/bootstrap")
+def bootstrap(x_session: str | None = Header(default=None)):
+    user = require_user(x_session)
+
+    projects = q.get_projects()
+    people = [
+        {
+            "employee_id": p["employee_id"], "first_en": p["first_en"], "last_en": p["last_en"],
+            "first_th": p["first_th"], "last_th": p["last_th"], "role": p["role"],
+            "position": p["position"], "tag_id": p.get("tag_id"),
+        }
+        for p in q.all_users()
+    ]
+    customers = db.fetchall("SELECT id, name FROM customers ORDER BY name")
+
+    live_id = q.live_project_id()
+    zones_rows = q.get_zones(live_id) if live_id else []
+    zones = [{"name": z["name"], "x": [z["x_min"], z["x_max"]], "y": [z["y_min"], z["y_max"]]} for z in zones_rows]
+    anchors_rows = q.get_anchors(live_id) if live_id else []
+    anchors = {a["anchor_id"]: [a["x"], a["y"]] for a in anchors_rows}
+
+    return {
+        "ok": True,
+        "user": public_user(user),
+        "projects": projects,
+        "people": people,
+        "customers": customers,
+        "zones": zones,
+        "anchors": anchors,
+        "live_project_id": live_id,
+        "deal_statuses": q.DEAL_STATUSES,
+    }
+
+
+# ---------------------------------------------------------------------
+# Overview / devices / live
+# ---------------------------------------------------------------------
+
+@app.get("/api/overview")
+def overview(
+    x_session: str | None = Header(default=None),
+    province: str | None = None, project: str | None = None, plan: str | None = None,
+    employee: str | None = None, customer: str | None = None,
+    from_: str | None = Query(default=None, alias="from"), to: str | None = None,
+):
+    user = require_user(x_session)
+    q_params = _query_params(province, project, plan, employee, customer, from_, to)
+    q_params, scope = q.apply_scope(q_params, user)
+    result = q.get_overview(q_params)
+    result["scope"] = scope
+    return result
+
+
+@app.get("/api/devices")
+def devices(x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    return {"ok": True, "anchors": q.get_anchors(), "tags": q.get_tags()}
+
+
+@app.get("/api/live")
+def live(x_session: str | None = Header(default=None), since: float = 0, rows: int = 400):
+    require_user(x_session)
+    return q.get_live_tags(rows=rows, since=since)
+
+
+# ---------------------------------------------------------------------
+# Visits / analytics
+# ---------------------------------------------------------------------
+
+@app.get("/api/visits")
+def visits(
+    x_session: str | None = Header(default=None),
+    province: str | None = None, project: str | None = None, plan: str | None = None,
+    employee: str | None = None, customer: str | None = None,
+    from_: str | None = Query(default=None, alias="from"), to: str | None = None,
+):
+    user = require_user(x_session)
+    q_params = _query_params(province, project, plan, employee, customer, from_, to)
+    q_params, scope = q.apply_scope(q_params, user)
+    return {"ok": True, "visits": q.get_visits(q_params), "scope": scope}
+
+
+@app.get("/api/visit")
+def visit_detail(key: str, x_session: str | None = Header(default=None)):
+    user = require_user(x_session)
+    result = q.get_visit(key)
+    if not result:
+        return {"error": "ไม่พบข้อมูลการเยี่ยมชม"}
+
+    if user["role"] == "sale" and result["employee_id"] != user["employee_id"]:
+        return {"error": "ไม่มีสิทธิ์ดูข้อมูลนี้"}
+
+    result["viewer_role"] = user["role"]
+    result["can_edit"] = user["role"] in {"admin", "sale_lead"}
+    return result
+
+
+@app.get("/api/heatmap")
+def heatmap(
+    x_session: str | None = Header(default=None),
+    province: str | None = None, project: str | None = None, plan: str | None = None,
+    employee: str | None = None, customer: str | None = None,
+    from_: str | None = Query(default=None, alias="from"), to: str | None = None,
+):
+    user = require_user(x_session)
+    q_params = _query_params(province, project, plan, employee, customer, from_, to)
+    q_params, _scope = q.apply_scope(q_params, user)
+    return q.get_heatmap(q_params)
+
+
+@app.get("/api/analytics")
+def analytics(
+    x_session: str | None = Header(default=None),
+    province: str | None = None, project: str | None = None, plan: str | None = None,
+    employee: str | None = None, customer: str | None = None,
+    from_: str | None = Query(default=None, alias="from"), to: str | None = None,
+):
+    require_role(x_session, {"admin", "sale_lead"})
+    q_params = _query_params(province, project, plan, employee, customer, from_, to)
+    return q.get_analytics(q_params)
+
+
+@app.post("/api/visit-meta")
+def visit_meta(payload: VisitMeta, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin", "sale_lead"})
+    row = db.fetchone("SELECT id FROM visits WHERE visit_key = %s", (payload.visit_key,))
+    if not row:
+        return {"ok": False, "error": "ไม่พบ visit"}
+    q.set_visit_meta(payload.visit_key, payload.customer_id, payload.deal_status)
+    return {"ok": True}
+
+
+@app.post("/api/note")
+def add_note(payload: NoteCreate, x_session: str | None = Header(default=None)):
+    user = require_user(x_session)
+    visit = q.get_visit(payload.visit_key)
+    if not visit:
+        return {"ok": False, "error": "ไม่พบ visit"}
+    if user["role"] == "sale" and visit["employee_id"] != user["employee_id"]:
+        return {"ok": False, "error": "ไม่มีสิทธิ์แก้ไขข้อมูลนี้"}
+    q.add_note(payload.visit_key, user["id"], payload.body.strip())
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------
+# Projects / anchors
+# ---------------------------------------------------------------------
+
+@app.post("/api/projects")
+def project_create(payload: ProjectCreate, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    return q.create_project(payload.model_dump())
+
+
+@app.get("/api/projects")
+def projects(x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    return {"ok": True, "projects": q.get_projects()}
+
+
+@app.get("/api/projects/{project_id}")
+def project_detail(project_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    project = q.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    return project
+
+
+@app.post("/api/projects/{project_id}/anchors")
+def anchor_create(project_id: str, payload: AnchorCreate, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    if not q.get_project(project_id):
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    return q.create_anchor(project_id, payload.model_dump())
+
+
+@app.get("/api/projects/{project_id}/anchors")
+def project_anchors(project_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    if not q.get_project(project_id):
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    return {"ok": True, "anchors": q.get_anchors(project_id)}
+
+
+# ---------------------------------------------------------------------
+# Anchor placement / coverage — real geometry, not placeholders
+# ---------------------------------------------------------------------
+
+@app.post("/api/calculation/anchors")
+def calculate_anchors(payload: dict[str, Any], x_session: str | None = Header(default=None)):
+    require_user(x_session)
+
+    width = float(payload.get("width_m", 20))
+    height = float(payload.get("height_m", 20))
+    margin = float(payload.get("margin_m", 1))
+    radius = float(payload.get("coverage_radius_m", 12))
+
+    anchors = calculations.suggest_anchor_layout(width, height, margin_m=margin, coverage_radius_m=radius)
+    coverage = calculations.analyze_coverage(anchors, radius_m=radius, width_m=width, height_m=height)
+
+    return {
+        "ok": True,
+        "input": payload,
+        "suggested_anchors": anchors,
+        "predicted_coverage": {k: v for k, v in coverage.items() if k not in ("gap_points", "gap_points_truncated")},
+    }
+
+
+@app.post("/api/calculation/coverage")
+def calculate_coverage(payload: dict[str, Any], x_session: str | None = Header(default=None)):
+    require_user(x_session)
+
+    anchors = payload.get("anchors", [])
+    radius = float(payload.get("coverage_radius_m", 10))
+    width = float(payload.get("width_m", 20))
+    height = float(payload.get("height_m", 20))
+    resolution = payload.get("resolution_m")
+
+    if not anchors:
+        raise HTTPException(status_code=400, detail="ต้องระบุตำแหน่ง anchor อย่างน้อย 1 จุด")
+
+    result = calculations.analyze_coverage(
+        anchors, radius_m=radius, width_m=width, height_m=height,
+        resolution_m=float(resolution) if resolution else None,
+    )
+    return {"ok": True, "coverage_radius_m": radius, "anchors": anchors, **result}
+
+
+# ---------------------------------------------------------------------
+# Positioning — real multilateration
+# ---------------------------------------------------------------------
+
+@app.get("/api/positioning/{project_id}")
+def positioning_snapshot(project_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    if not q.get_project(project_id):
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    live = q.get_live_tags(rows=0)
+    return {"ok": True, "project_id": project_id, "tags": live.get("tags", {})}
+
+
+@app.post("/api/positioning/{project_id}/ingest")
+def positioning_ingest(project_id: str, payload: PositioningIngest, x_session: str | None = Header(default=None)):
+    """Real UWB positioning entry point: turn raw anchor-to-tag ranges into
+    an (x, y) fix via least-squares multilateration (see positioning.py),
+    persist it, and keep the visit lifecycle in sync — exactly like the
+    demo simulator does, so real hardware can replace the simulator with
+    no other backend changes. Point your anchor gateway / tag firmware
+    here once it's reporting real two-way-ranging distances."""
+    require_user(x_session)
+
+    project = q.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+
+    anchor_by_id = {a["anchor_id"]: (a["x"], a["y"]) for a in project["anchors"]}
+    known = [(anchor_by_id[r.anchor_id], r.distance_m) for r in payload.ranges if r.anchor_id in anchor_by_id]
+
+    if len(known) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ต้องมีระยะจาก anchor ที่รู้จักในโครงการนี้อย่างน้อย 3 จุด (ได้รับ {len(known)})",
+        )
+
+    anchor_positions = [k[0] for k in known]
+    distances = [k[1] for k in known]
+    fix = positioning.trilaterate(anchor_positions, distances)
+    if fix is None:
+        raise HTTPException(status_code=422, detail="คำนวณตำแหน่งไม่สำเร็จ (ระยะที่ได้อาจไม่สอดคล้องกัน)")
+
+    result = tracking.ingest_fix(payload.tag_id, fix.x, fix.y)
+    return {
+        "ok": True,
+        "tag_id": payload.tag_id,
+        "x": round(fix.x, 3),
+        "y": round(fix.y, 3),
+        "zone": result["zone"],
+        "residual_m": fix.residual_m,
+        "anchors_used": fix.anchors_used,
+        "ts": result["ts"],
+    }
+
+
+# ---------------------------------------------------------------------
+# Serve frontend
+# ---------------------------------------------------------------------
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "SUPALAI-UWB-frontend"
+
+
+@app.get("/", include_in_schema=False)
+def frontend_index():
+    index_file = FRONTEND_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return {"message": "SUPALAI API is running. Open /docs."}
+
+
+@app.get("/login.html", include_in_schema=False)
+def frontend_login():
+    file = FRONTEND_DIR / "login.html"
+    if file.exists():
+        return FileResponse(file)
+    raise HTTPException(status_code=404)
+
+
+@app.get("/dashboard.html", include_in_schema=False)
+def frontend_dashboard():
+    file = FRONTEND_DIR / "dashboard.html"
+    if file.exists():
+        return FileResponse(file)
+    raise HTTPException(status_code=404)
+
+
+try:
+    from fastapi.staticfiles import StaticFiles
+
+    if FRONTEND_DIR.exists():
+        app.mount("/css", StaticFiles(directory=FRONTEND_DIR / "css"), name="css")
+        app.mount("/js", StaticFiles(directory=FRONTEND_DIR / "js"), name="js")
+        assets_dir = FRONTEND_DIR / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+except Exception:
+    pass
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=settings.debug)

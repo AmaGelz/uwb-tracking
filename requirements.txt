@@ -1,0 +1,3 @@
+# Everything in this repo (backend, migration/migration.py, scripts/generate_seed.py)
+# uses the same small dependency set — see backend/requirements.txt.
+-r backend/requirements.txt

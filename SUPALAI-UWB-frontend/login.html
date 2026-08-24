@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign In | SUPALAI</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body class="signin-page">
+  <form class="signin" id="signin-form">
+    <div class="brand" style="justify-content:center;margin-bottom:26px;font-size:22px">
+      <span class="brand-mark" style="width:36px;height:36px;font-size:16px">S</span>SUPALAI
+    </div>
+    <h2>Sign In</h2>
+    <div id="signin-err"></div>
+    <div class="field">
+      <label class="label" for="si-email">Email</label>
+      <input class="control" id="si-email" type="email" autocomplete="username" placeholder="name@supalai.com" required>
+    </div>
+    <div class="field">
+      <label class="label" for="si-pw">Password</label>
+      <input class="control" id="si-pw" type="password" autocomplete="current-password" required>
+    </div>
+    <button class="btn btn-primary btn-block" type="submit">Next</button>
+    <div class="signin-divider"><span>OR</span></div>
+    <div class="google-wrap" id="google-btn"></div>
+    <div class="signin-hint">
+      บัญชีตัวอย่าง (รหัสผ่านทั้งหมด: 1234)<br>
+      admin@supalai.com · lead@supalai.com · mandee.jai@supalai.com
+    </div>
+  </form>
+  <script src="js/api.js"></script>
+  <script src="js/auth.js"></script>
+</body>
+</html>
