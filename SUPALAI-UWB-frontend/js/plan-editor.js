@@ -34,8 +34,18 @@
     zoom: document.getElementById('zoom-level'),
     planTitle: document.getElementById('plan-title'),
     planMeta: document.getElementById('plan-meta'),
+    projectSelect: document.getElementById('project-select'),
+    planSelect: document.getElementById('plan-select'),
+    newPlan: document.getElementById('new-plan'),
+    editPlan: document.getElementById('edit-plan'),
+    savePlan: document.getElementById('save-plan'),
+    planSettings: document.getElementById('plan-settings'),
     planInput: document.getElementById('plan-id-input'),
-    loadPlan: document.getElementById('load-plan'),
+    planNameInput: document.getElementById('plan-name-input'),
+    planWidthInput: document.getElementById('plan-width-input'),
+    planHeightInput: document.getElementById('plan-height-input'),
+    planVersionInput: document.getElementById('plan-version-input'),
+    planActiveInput: document.getElementById('plan-active-input'),
     selectionSummary: document.getElementById('selection-summary'),
     selectionDetails: document.getElementById('selection-details'),
     anchorSettings: document.getElementById('anchor-settings'),
@@ -58,6 +68,7 @@
   };
 
   const state = {
+    projects: [],
     plan: null,
     objects: [],
     zones: [],
@@ -72,6 +83,9 @@
     gridVisible: true,
     snapEnabled: true,
     gridStep: 1,
+    isAdmin: false,
+    editMode: false,
+    isNewPlan: false,
     canEdit: false,
     busy: false,
     zoneNameOpen: false,
@@ -222,6 +236,7 @@
 
   function renderBoundary() {
     clearLayer(ui.boundaryLayer);
+    if (!state.plan) return;
     const boundary = svgElement('rect', {
       class: 'plan-boundary',
       x: 0,
@@ -615,6 +630,7 @@
 
   function updateInspector() {
     const entity = entityBySelection();
+    ui.planSettings.hidden = !state.plan;
     ui.selectionSummary.textContent = entity
       ? `${state.selected.kind[0].toUpperCase()}${state.selected.kind.slice(1)}`
       : 'ยังไม่ได้เลือกวัตถุ';
@@ -634,6 +650,59 @@
     });
     updateAnchorSettings(entity);
     updateLineSettings(entity);
+  }
+
+  function hasPersistedPlan() {
+    return Boolean(state.plan?.plan_id && !state.isNewPlan);
+  }
+
+  function populatePlanForm() {
+    if (!state.plan) return;
+    ui.planInput.value = state.plan.plan_id || '';
+    ui.planNameInput.value = state.plan.name || '';
+    ui.planWidthInput.value = String(Number(state.plan.width_m) || 20);
+    ui.planHeightInput.value = String(Number(state.plan.height_m) || 20);
+    ui.planVersionInput.value = String(Number(state.plan.version) || 1);
+    ui.planActiveInput.checked = Boolean(state.plan.is_active);
+  }
+
+  function updatePlanControls() {
+    const hasProject = Boolean(ui.projectSelect.value);
+    const persisted = hasPersistedPlan();
+    const formEditable = state.isAdmin && state.editMode && Boolean(state.plan) && !state.busy;
+    state.canEdit = formEditable && persisted;
+
+    ui.projectSelect.disabled = state.busy || state.isNewPlan;
+    ui.planSelect.disabled = state.busy || state.isNewPlan || !hasProject;
+    ui.newPlan.disabled = state.busy || !state.isAdmin || !hasProject;
+    ui.editPlan.disabled = state.busy || !state.isAdmin || !persisted || state.editMode;
+    ui.savePlan.disabled = state.busy || !formEditable;
+    ui.editPlan.classList.toggle('is-active', state.editMode && persisted);
+
+    ui.planInput.disabled = !formEditable;
+    ui.planInput.readOnly = !state.isNewPlan;
+    ui.planNameInput.disabled = !formEditable;
+    ui.planWidthInput.disabled = !formEditable;
+    ui.planHeightInput.disabled = !formEditable;
+    ui.planVersionInput.disabled = !formEditable;
+    ui.planActiveInput.disabled = !formEditable;
+
+    document.querySelectorAll('[data-tool]').forEach(button => {
+      if (EDIT_TOOLS.has(button.dataset.tool)) button.disabled = !state.canEdit;
+    });
+    document.getElementById('tool-delete').disabled = !state.canEdit;
+
+    if (!state.canEdit && EDIT_TOOLS.has(state.tool)) setTool('select');
+    if (!state.isAdmin) {
+      ui.roleHint.textContent = `Read only · role ${session.user?.role || '-'} ไม่มีสิทธิ์แก้ไขแปลน`;
+    } else if (state.isNewPlan) {
+      ui.roleHint.textContent = 'Admin · กรอกข้อมูลแล้วกดบันทึกก่อนเริ่มวาดแปลน';
+    } else if (state.editMode) {
+      ui.roleHint.textContent = 'Admin · โหมดแก้ไข การวาดและแก้ไขวัตถุจะบันทึกลงฐานข้อมูลทันที';
+    } else {
+      ui.roleHint.textContent = 'Admin · กดแก้ไขเพื่อเปลี่ยนข้อมูลหรือวาดบนแปลน';
+    }
+    ui.roleHint.classList.toggle('can-edit', state.isAdmin);
   }
 
   function updateAnchorSettings(entity) {
@@ -704,6 +773,7 @@
   async function safeMutation(action, successMessage) {
     if (state.busy) return null;
     state.busy = true;
+    updatePlanControls();
     try {
       const result = await action();
       if (successMessage) setMessage(successMessage, 'ok');
@@ -713,6 +783,7 @@
       return null;
     } finally {
       state.busy = false;
+      updatePlanControls();
     }
   }
 
@@ -1285,10 +1356,15 @@
       if (event.code === 'Space') state.spaceDown = false;
     });
 
-    ui.loadPlan.addEventListener('click', () => void loadPlan(ui.planInput.value.trim()));
-    ui.planInput.addEventListener('keydown', event => {
-      if (event.key === 'Enter') void loadPlan(ui.planInput.value.trim());
+    ui.projectSelect.addEventListener('change', onProjectChanged);
+    ui.planSelect.addEventListener('change', () => {
+      const planId = ui.planSelect.value;
+      if (planId) void loadPlan(planId);
+      else showEmptyCanvas('เลือกแปลน หรือกดเพิ่มแปลนเพื่อเริ่มต้น');
     });
+    ui.newPlan.addEventListener('click', beginNewPlan);
+    ui.editPlan.addEventListener('click', beginEditPlan);
+    ui.savePlan.addEventListener('click', () => void savePlan());
     ui.logout.addEventListener('click', async () => {
       try { await api('/api/signout', { method: 'POST' }); } catch (_error) { /* leave anyway */ }
       localStorage.removeItem('tw_token');
@@ -1309,7 +1385,8 @@
     ui.userName.textContent = fullName || user.email || user.employee_id;
     ui.userMeta.textContent = `${user.employee_id} · ${user.position || user.role}`;
     ui.avatar.textContent = `${(user.first_en || '?')[0]}${(user.last_en || '')[0] || ''}`.toUpperCase();
-    state.canEdit = user.role === 'admin';
+    state.isAdmin = user.role === 'admin';
+    state.canEdit = false;
     ui.roleHint.textContent = state.canEdit
       ? 'Admin · สามารถวาด แก้ไข และลบ plan objects ได้'
       : `Read only · role ${user.role} ไม่มีสิทธิ์แก้ไขแปลน`;
@@ -1318,12 +1395,177 @@
       if (EDIT_TOOLS.has(button.dataset.tool)) button.disabled = !state.canEdit;
     });
     document.getElementById('tool-delete').disabled = !state.canEdit;
+    updatePlanControls();
   }
 
-  async function fallbackPlanId() {
-    const bootstrap = await api('/api/bootstrap');
-    const projects = bootstrap.projects || [];
-    return projects.map(project => project.plan_id).find(Boolean) || '';
+  function projectById(projectId) {
+    return state.projects.find(project => String(project.project_id) === String(projectId)) || null;
+  }
+
+  function projectForPlan(planId) {
+    return state.projects.find(project => (project.plans || []).some(
+      plan => String(plan.plan_id) === String(planId)
+    )) || null;
+  }
+
+  function setSelectOptions(select, items, placeholder) {
+    select.replaceChildren(new Option(placeholder, ''));
+    items.forEach(item => select.add(new Option(item.label, item.value)));
+  }
+
+  function renderPlanOptions(selectedPlanId = '') {
+    const project = projectById(ui.projectSelect.value);
+    const plans = (project?.plans || []).map(plan => ({
+      value: String(plan.plan_id),
+      label: `${plan.name}${plan.live ? ' · ใช้งานอยู่' : ''}`,
+    }));
+    setSelectOptions(ui.planSelect, plans, plans.length ? 'เลือกแปลน' : 'โครงการนี้ยังไม่มีแปลน');
+    if (plans.some(plan => plan.value === String(selectedPlanId))) {
+      ui.planSelect.value = String(selectedPlanId);
+    }
+    updatePlanControls();
+  }
+
+  async function loadProjects(preferredProjectId = '', preferredPlanId = '') {
+    const result = await api('/api/projects');
+    state.projects = result.projects || [];
+    setSelectOptions(
+      ui.projectSelect,
+      state.projects.map(project => ({ value: String(project.project_id), label: project.name })),
+      state.projects.length ? 'เลือกโครงการ' : 'ยังไม่มีโครงการ',
+    );
+
+    const planProject = preferredPlanId ? projectForPlan(preferredPlanId) : null;
+    const projectId = planProject?.project_id || preferredProjectId;
+    if (projectById(projectId)) ui.projectSelect.value = String(projectId);
+    else if (state.projects.length) ui.projectSelect.value = String(state.projects[0].project_id);
+    renderPlanOptions(preferredPlanId);
+  }
+
+  function resetPlanEntities() {
+    state.objects = [];
+    state.zones = [];
+    state.anchors = [];
+    state.dimensions = [];
+    state.selected = null;
+    state.draft = null;
+    state.drag = null;
+  }
+
+  function showEmptyCanvas(message = 'เลือกโครงการและแปลน หรือกดเพิ่มแปลน') {
+    cancelInteraction();
+    state.plan = null;
+    state.editMode = false;
+    state.isNewPlan = false;
+    resetPlanEntities();
+    ui.planTitle.textContent = 'Plan Editor';
+    ui.planMeta.textContent = 'พิกัดทั้งหมดใช้หน่วยเมตร · ยังไม่ได้เลือกแปลน';
+    document.title = 'Plan Editor | SUPALAI';
+    const url = new URL(window.location.href);
+    url.searchParams.delete('plan_id');
+    history.replaceState(null, '', url);
+    state.view = { x: -1, y: -1, width: 22, height: 22 };
+    state.fitWidth = 22;
+    hideLoading();
+    applyViewBox(true);
+    updatePlanControls();
+    setMessage(message);
+  }
+
+  function onProjectChanged() {
+    renderPlanOptions();
+    showEmptyCanvas('เลือกแปลนของโครงการนี้ หรือกดเพิ่มแปลน');
+  }
+
+  function beginNewPlan() {
+    if (!state.isAdmin || !ui.projectSelect.value) return;
+    cancelInteraction();
+    resetPlanEntities();
+    state.plan = {
+      plan_id: '',
+      project_id: ui.projectSelect.value,
+      name: '',
+      width_m: 20,
+      height_m: 20,
+      is_active: true,
+      version: 1,
+    };
+    state.isNewPlan = true;
+    state.editMode = true;
+    ui.planSelect.value = '';
+    ui.planTitle.textContent = 'แปลนใหม่';
+    ui.planMeta.textContent = `${projectById(state.plan.project_id)?.name || state.plan.project_id} · ยังไม่ได้บันทึก`;
+    populatePlanForm();
+    hideLoading();
+    fitView();
+    updatePlanControls();
+    ui.planInput.focus();
+    setMessage('กรอก Plan properties แล้วกดบันทึกเพื่อสร้างแปลนในฐานข้อมูล');
+  }
+
+  function beginEditPlan() {
+    if (!state.isAdmin || !hasPersistedPlan()) return;
+    state.editMode = true;
+    populatePlanForm();
+    updatePlanControls();
+    ui.planNameInput.focus();
+    setMessage('เข้าสู่โหมดแก้ไขแล้ว');
+  }
+
+  function planPayloadFromForm() {
+    const planId = ui.planInput.value.trim();
+    const name = ui.planNameInput.value.trim();
+    const width = Number(ui.planWidthInput.value);
+    const height = Number(ui.planHeightInput.value);
+    const version = Number(ui.planVersionInput.value);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(planId)) {
+      throw new Error('Plan ID ต้องใช้ตัวอักษร ตัวเลข จุด ขีดกลาง หรือ underscore และห้ามเว้นวรรค');
+    }
+    if (!name) throw new Error('กรุณาระบุชื่อแปลน');
+    if (!Number.isFinite(width) || width <= 0) throw new Error('ความกว้างต้องมากกว่า 0 เมตร');
+    if (!Number.isFinite(height) || height <= 0) throw new Error('ความสูงต้องมากกว่า 0 เมตร');
+    if (!Number.isInteger(version) || version < 1) throw new Error('Version ต้องเป็นจำนวนเต็มตั้งแต่ 1');
+    return {
+      plan_id: planId,
+      name,
+      width_m: width,
+      height_m: height,
+      is_active: ui.planActiveInput.checked,
+      version,
+    };
+  }
+
+  async function savePlan() {
+    if (!state.isAdmin || !state.editMode || !state.plan) return;
+    let payload;
+    try {
+      payload = planPayloadFromForm();
+    } catch (error) {
+      setMessage(error.message, 'error');
+      return;
+    }
+
+    const creating = state.isNewPlan;
+    const projectId = state.plan.project_id;
+    const endpoint = creating
+      ? `/api/projects/${encodeURIComponent(projectId)}/plans`
+      : `/api/plans/${encodeURIComponent(state.plan.plan_id)}`;
+    const requestBody = creating ? payload : {
+      name: payload.name,
+      width_m: payload.width_m,
+      height_m: payload.height_m,
+      is_active: payload.is_active,
+      version: payload.version,
+    };
+    const response = await safeMutation(
+      () => api(endpoint, { method: creating ? 'POST' : 'PUT', body: JSON.stringify(requestBody) }),
+      null,
+    );
+    if (!response?.plan) return;
+
+    await loadProjects(projectId, response.plan.plan_id);
+    await loadPlan(response.plan.plan_id);
+    setMessage(creating ? 'สร้างแปลนและบันทึกลงฐานข้อมูลแล้ว' : 'บันทึกการแก้ไขแปลนแล้ว', 'ok');
   }
 
   async function loadPlan(planId) {
@@ -1348,7 +1590,14 @@
       state.zones = zoneResult.zones || [];
       state.anchors = anchorResult.anchors || [];
       state.dimensions = dimensionResult.dimensions || [];
-      ui.planInput.value = state.plan.plan_id;
+      state.isNewPlan = false;
+      state.editMode = false;
+      const project = projectForPlan(state.plan.plan_id);
+      if (project) {
+        ui.projectSelect.value = String(project.project_id);
+        renderPlanOptions(state.plan.plan_id);
+      }
+      populatePlanForm();
       ui.planTitle.textContent = state.plan.name;
       ui.planMeta.textContent = `${state.plan.plan_id} · ${Number(state.plan.width_m).toFixed(2)} × ${Number(state.plan.height_m).toFixed(2)} m · Version ${state.plan.version}`;
       document.title = `${state.plan.name} | Plan Editor`;
@@ -1358,6 +1607,7 @@
       hideLoading();
       fitView();
       setTool('select');
+      updatePlanControls();
     } catch (error) {
       showLoading(`โหลดแปลนไม่สำเร็จ: ${error?.message || error}`, true);
       setMessage('ตรวจสอบ Plan ID และการเชื่อมต่อ backend', 'error');
@@ -1380,15 +1630,15 @@
       return;
     }
 
-    let planId = new URLSearchParams(window.location.search).get('plan_id') || '';
-    if (!planId) {
-      try { planId = await fallbackPlanId(); }
-      catch (error) {
-        showLoading(`โหลดรายการแปลนไม่สำเร็จ: ${error?.message || error}`, true);
-        return;
-      }
+    const planId = new URLSearchParams(window.location.search).get('plan_id') || '';
+    try {
+      await loadProjects('', planId);
+    } catch (error) {
+      showLoading(`โหลดรายการโครงการและแปลนไม่สำเร็จ: ${error?.message || error}`, true);
+      return;
     }
-    await loadPlan(planId);
+    if (planId) await loadPlan(planId);
+    else showEmptyCanvas('เลือกแปลน หรือกดเพิ่มแปลนเพื่อเริ่มจาก canvas ว่าง');
   }
 
   window.SUPALAI_PLAN_EDITOR = Object.freeze({

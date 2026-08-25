@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "supalai-uwb-tracking",
+  "account_id": "756b31ef87d50b4bb9530186a86675ac",
   "compatibility_date": "2026-08-25",
   "assets": {
     "directory": "./SUPALAI-UWB-frontend",

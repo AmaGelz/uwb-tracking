@@ -119,6 +119,24 @@ async function getProjects(): Promise<Profile[]> {
   }));
 }
 
+async function syncProjectPlan(projectId: string): Promise<void> {
+  const plan = unwrap<any>(await db
+    .from("plans")
+    .select("id,name,width_m,height_m,is_active,updated_at")
+    .eq("project_id", projectId)
+    .order("is_active", { ascending: false })
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle());
+  if (!plan) return;
+  unwrap(await db.from("projects").update({
+    plan_id: plan.id,
+    plan_name: plan.name,
+    width_m: plan.width_m,
+    height_m: plan.height_m,
+  }).eq("id", projectId));
+}
+
 async function getAnchors(projectId?: string, planId?: string): Promise<Profile[]> {
   let query = db.from("anchors").select("*").order("anchor_id");
   if (projectId) query = query.eq("project_id", projectId);
@@ -512,14 +530,24 @@ async function route(req: Request, profile: Profile): Promise<Response> {
         .then((result: any) => unwrap<any[]>(result)),
       db.from("customers").select("id,name").order("name").then((result: any) => unwrap<any[]>(result)),
     ]);
-    let liveProjectId: string | null = projects[0]?.project_id ?? null;
+    let liveProjectId: string | null = null;
+    let livePlanId: string | null = null;
     for (const project of projects) {
-      if ((await getAnchors(project.project_id)).length) { liveProjectId = project.project_id; break; }
+      const activePlan = (project.plans || []).find((plan: Profile) => plan.live);
+      if (activePlan) {
+        liveProjectId = project.project_id;
+        livePlanId = activePlan.plan_id;
+        break;
+      }
     }
-    const [zones, anchors] = liveProjectId ? await Promise.all([
-      db.from("zones").select("name,x_min,x_max,y_min,y_max").eq("project_id", liveProjectId).order("id")
+    if (!liveProjectId && projects.length) {
+      liveProjectId = projects[0].project_id;
+      livePlanId = projects[0].plan_id || projects[0].plans?.[0]?.plan_id || null;
+    }
+    const [zones, anchors] = livePlanId ? await Promise.all([
+      db.from("zones").select("name,x_min,x_max,y_min,y_max").eq("plan_id", livePlanId).order("id")
         .then((result: any) => unwrap<any[]>(result)),
-      getAnchors(liveProjectId),
+      getAnchors(undefined, livePlanId),
     ]) : [[], []];
     return json(req, {
       ok: true,
@@ -530,6 +558,7 @@ async function route(req: Request, profile: Profile): Promise<Response> {
       zones: zones.map((zone: Profile) => ({ name: zone.name, x: [zone.x_min, zone.x_max], y: [zone.y_min, zone.y_max] })),
       anchors: Object.fromEntries(anchors.map((anchor) => [anchor.anchor_id, [anchor.x, anchor.y]])),
       live_project_id: liveProjectId,
+      live_plan_id: livePlanId,
       deal_statuses: DEAL_STATUSES,
     });
   }
@@ -601,15 +630,30 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     requireRole(profile, ["admin"]);
     const projectId = decodeURIComponent(match[1]);
     const payload = await body(req);
+    const project = unwrap<any>(await db.from("projects").select("id").eq("id", projectId).maybeSingle());
+    if (!project) return fail(req, 404, "ไม่พบโครงการ");
+    const planId = String(payload.plan_id || "").trim();
+    const name = String(payload.name || "").trim();
+    const width = Number(payload.width_m);
+    const height = Number(payload.height_m);
+    const version = payload.version == null ? 1 : Number(payload.version);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(planId)) return fail(req, 422, "Plan ID ไม่ถูกต้อง");
+    if (!name) return fail(req, 422, "กรุณาระบุชื่อแปลน");
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return fail(req, 422, "ขนาดแปลนต้องมากกว่า 0 เมตร");
+    if (!Number.isInteger(version) || version < 1) return fail(req, 422, "Version ต้องเป็นจำนวนเต็มตั้งแต่ 1");
+    const duplicateId = unwrap<any>(await db.from("plans").select("id").eq("id", planId).maybeSingle());
+    if (duplicateId) return fail(req, 409, "Plan ID นี้มีอยู่แล้ว");
+    const duplicateName = unwrap<any>(await db.from("plans").select("id").eq("project_id", projectId).eq("name", name).maybeSingle());
+    if (duplicateName) return fail(req, 409, "ชื่อแปลนซ้ำในโครงการ");
     const inserted = unwrap<any>(await db.from("plans").insert({
-      id: payload.plan_id, project_id: projectId, name: payload.name,
-      width_m: payload.width_m, height_m: payload.height_m,
-      is_active: Boolean(payload.is_active), version: payload.version || 1,
+      id: planId, project_id: projectId, name,
+      width_m: width, height_m: height,
+      is_active: payload.is_active !== false, version,
     }).select().single());
     if (inserted.is_active) {
-      await db.from("plans").update({ is_active: false }).eq("project_id", projectId).neq("id", inserted.id);
-      await db.from("projects").update({ plan_id: inserted.id, plan_name: inserted.name, width_m: inserted.width_m, height_m: inserted.height_m }).eq("id", projectId);
+      unwrap(await db.from("plans").update({ is_active: false }).eq("project_id", projectId).neq("id", inserted.id));
     }
+    await syncProjectPlan(projectId);
     const { id, ...rest } = inserted;
     return json(req, { ok: true, plan: { plan_id: id, ...rest } });
   }
@@ -625,12 +669,34 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     requireRole(profile, ["admin"]);
     const planId = decodeURIComponent(match[1]);
     const payload = await body(req);
-    const allowed = Object.fromEntries(Object.entries(payload).filter(([key]) => ["name", "width_m", "height_m", "is_active", "version"].includes(key)));
+    const existing = unwrap<any>(await db.from("plans").select("id,project_id").eq("id", planId).maybeSingle());
+    if (!existing) return fail(req, 404, "ไม่พบแปลน");
+    const allowed: Profile = {};
+    if (payload.name !== undefined) {
+      const name = String(payload.name || "").trim();
+      if (!name) return fail(req, 422, "กรุณาระบุชื่อแปลน");
+      const duplicateName = unwrap<any>(await db.from("plans").select("id").eq("project_id", existing.project_id).eq("name", name).neq("id", planId).maybeSingle());
+      if (duplicateName) return fail(req, 409, "ชื่อแปลนซ้ำในโครงการ");
+      allowed.name = name;
+    }
+    for (const key of ["width_m", "height_m"]) {
+      if (payload[key] === undefined) continue;
+      const value = Number(payload[key]);
+      if (!Number.isFinite(value) || value <= 0) return fail(req, 422, "ขนาดแปลนต้องมากกว่า 0 เมตร");
+      allowed[key] = value;
+    }
+    if (payload.version !== undefined) {
+      const version = Number(payload.version);
+      if (!Number.isInteger(version) || version < 1) return fail(req, 422, "Version ต้องเป็นจำนวนเต็มตั้งแต่ 1");
+      allowed.version = version;
+    }
+    if (payload.is_active !== undefined) allowed.is_active = Boolean(payload.is_active);
+    if (!Object.keys(allowed).length) return fail(req, 400, "ไม่มีข้อมูลสำหรับแก้ไขแปลน");
     const updated = unwrap<any>(await db.from("plans").update({ ...allowed, updated_at: new Date().toISOString() }).eq("id", planId).select().single());
     if (updated.is_active) {
-      await db.from("plans").update({ is_active: false }).eq("project_id", updated.project_id).neq("id", planId);
-      await db.from("projects").update({ plan_id: planId, plan_name: updated.name, width_m: updated.width_m, height_m: updated.height_m }).eq("id", updated.project_id);
+      unwrap(await db.from("plans").update({ is_active: false }).eq("project_id", updated.project_id).neq("id", planId));
     }
+    await syncProjectPlan(updated.project_id);
     const { id, ...rest } = updated;
     return json(req, { ok: true, plan: { plan_id: id, ...rest } });
   }

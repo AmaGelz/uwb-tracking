@@ -115,14 +115,69 @@ function emptyRow(cols, msg) {
 }
 
 /* -------------------------------------------------------------- floor plan */
+function selectedPlanId() {
+  if (S.filters.plan) return S.filters.plan;
+  if (S.filters.project) {
+    const project = (S.boot?.projects || []).find(item => item.project_id === S.filters.project);
+    const plan = (project?.plans || []).find(item => item.live) || project?.plans?.[0];
+    if (plan) return plan.plan_id;
+  }
+  return S.boot?.live_plan_id || '';
+}
+
+async function loadPlanDrawing(planId = selectedPlanId()) {
+  if (!planId) return {};
+  S.planDrawingCache = S.planDrawingCache || new Map();
+  if (S.planDrawingCache.has(planId)) return S.planDrawingCache.get(planId);
+  const encoded = encodeURIComponent(planId);
+  const pending = Promise.all([
+    requestApi(`/api/plans/${encoded}`),
+    requestApi(`/api/plans/${encoded}/objects`),
+    requestApi(`/api/plans/${encoded}/zones`),
+    requestApi(`/api/plans/${encoded}/anchors`),
+    requestApi(`/api/plans/${encoded}/dimensions`),
+  ]).then(([plan, objects, zones, anchors, dimensions]) => ({
+    plan: plan.plan,
+    objects: objects.objects || [],
+    zones: zones.zones || [],
+    anchors: Object.fromEntries((anchors.anchors || []).map(anchor => [anchor.anchor_id, [anchor.x, anchor.y]])),
+    dimensions: dimensions.dimensions || [],
+  })).catch(error => {
+    S.planDrawingCache.delete(planId);
+    throw error;
+  });
+  S.planDrawingCache.set(planId, pending);
+  return pending;
+}
+
 function planSVG(opts = {}) {
   const zs = opts.zones || (S.boot ? S.boot.zones : []) || [];
   const anc = opts.anchors || (S.boot ? S.boot.anchors : {}) || {};
+  const objects = opts.objects || [];
+  const dimensions = opts.dimensions || [];
+  const plan = opts.plan || null;
   const tags = opts.tags || [];
   const path = opts.path || [];
 
   let xs = [], ys = [];
-  zs.forEach(z => { xs.push(z.x[0], z.x[1]); ys.push(z.y[0], z.y[1]); });
+  if (plan) {
+    xs.push(0, Number(plan.width_m));
+    ys.push(0, Number(plan.height_m));
+  }
+  zs.forEach(z => {
+    const points = z.geometry?.points || [];
+    if (points.length) points.forEach(point => { xs.push(Number(point[0])); ys.push(Number(point[1])); });
+    else if (z.x && z.y) { xs.push(z.x[0], z.x[1]); ys.push(z.y[0], z.y[1]); }
+    else { xs.push(z.x_min, z.x_max); ys.push(z.y_min, z.y_max); }
+  });
+  objects.forEach(object => {
+    const geometry = object.geometry || {};
+    (geometry.points || []).forEach(point => { xs.push(Number(point[0])); ys.push(Number(point[1])); });
+    if (Number.isFinite(Number(geometry.x))) {
+      xs.push(Number(geometry.x), Number(geometry.x) + Number(geometry.width || 0));
+      ys.push(Number(geometry.y), Number(geometry.y) + Number(geometry.height || 0));
+    }
+  });
   Object.values(anc).forEach(p => { xs.push(p[0]); ys.push(p[1]); });
   tags.forEach(t => { if (t.x != null) { xs.push(t.x); ys.push(t.y); } });
   path.forEach(p => { xs.push(p[0]); ys.push(p[1]); });
@@ -133,8 +188,10 @@ function planSVG(opts = {}) {
   const sorted = a => a.slice().sort((p, q) => p - q);
   const qt = (a, f) => a[Math.min(a.length - 1, Math.floor(a.length * f))];
   const sx = sorted(xs), sy = sorted(ys), pad = 0.45;
-  const x0 = qt(sx, 0.01) - pad, x1 = qt(sx, 0.99) + pad;
-  const y0 = qt(sy, 0.01) - pad, y1 = qt(sy, 0.99) + pad;
+  const x0 = plan ? -pad : qt(sx, 0.01) - pad;
+  const x1 = plan ? Number(plan.width_m) + pad : qt(sx, 0.99) + pad;
+  const y0 = plan ? -pad : qt(sy, 0.01) - pad;
+  const y1 = plan ? Number(plan.height_m) + pad : qt(sy, 0.99) + pad;
   const W = 640, H = Math.max(260, Math.min(720, W * (y1 - y0) / (x1 - x0 || 1)));
   const X = v => (v - x0) / (x1 - x0) * W;
   const Y = v => H - (v - y0) / (y1 - y0) * H;
@@ -142,13 +199,47 @@ function planSVG(opts = {}) {
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="แผนผังโครงการ">`;
   s += `<rect x="0" y="0" width="${W}" height="${H}" fill="#fff" rx="6"/>`;
 
+  if (plan) {
+    s += `<rect x="${X(0)}" y="${Y(Number(plan.height_m))}" width="${X(Number(plan.width_m)) - X(0)}"
+            height="${Y(0) - Y(Number(plan.height_m))}" fill="none" stroke="#12315f" stroke-width="1.4"/>`;
+  }
+
+  objects.forEach(object => {
+    const geometry = object.geometry || {};
+    const type = String(geometry.type || object.object_type || '').toLowerCase();
+    if (type === 'line' && (geometry.points || []).length >= 2) {
+      const points = geometry.points.slice(0, 2).map(point => `${X(Number(point[0]))},${Y(Number(point[1]))}`).join(' ');
+      s += `<polyline points="${points}" fill="none" stroke="#344054" stroke-width="1.6"/>`;
+    } else if (type === 'rectangle' && Number.isFinite(Number(geometry.x))) {
+      const left = X(Number(geometry.x));
+      const top = Y(Number(geometry.y) + Number(geometry.height));
+      s += `<rect x="${left}" y="${top}" width="${Math.abs(X(Number(geometry.x) + Number(geometry.width)) - left)}"
+              height="${Math.abs(Y(Number(geometry.y)) - top)}" fill="#475467" fill-opacity=".035" stroke="#344054" stroke-width="1.4"/>`;
+    }
+  });
+
   zs.forEach(z => {
-    const w = X(z.x[1]) - X(z.x[0]), h = Y(z.y[0]) - Y(z.y[1]);
-    s += `<rect x="${X(z.x[0])}" y="${Y(z.y[1])}" width="${w}" height="${h}"
-            fill="#12315f" fill-opacity=".045" stroke="#12315f" stroke-opacity=".28"
-            stroke-dasharray="6 4" rx="3"/>`;
-    s += `<text x="${X(z.x[0]) + 9}" y="${Y(z.y[1]) + 19}" font-size="12"
-            fill="#475467">${esc(z.name)}</text>`;
+    const points = z.geometry?.points || [];
+    if (points.length >= 3) {
+      const polygon = points.map(point => `${X(Number(point[0]))},${Y(Number(point[1]))}`).join(' ');
+      s += `<polygon points="${polygon}" fill="#12315f" fill-opacity=".06" stroke="#12315f"
+              stroke-opacity=".45" stroke-dasharray="6 4"/>`;
+      s += `<text x="${X(Number(points[0][0])) + 9}" y="${Y(Number(points[0][1])) + 19}" font-size="12" fill="#475467">${esc(z.name)}</text>`;
+    } else {
+      const zx = z.x || [z.x_min, z.x_max];
+      const zy = z.y || [z.y_min, z.y_max];
+      const w = X(zx[1]) - X(zx[0]), h = Y(zy[0]) - Y(zy[1]);
+      s += `<rect x="${X(zx[0])}" y="${Y(zy[1])}" width="${w}" height="${h}"
+              fill="#12315f" fill-opacity=".045" stroke="#12315f" stroke-opacity=".28"
+              stroke-dasharray="6 4" rx="3"/>`;
+      s += `<text x="${X(zx[0]) + 9}" y="${Y(zy[1]) + 19}" font-size="12" fill="#475467">${esc(z.name)}</text>`;
+    }
+  });
+
+  dimensions.forEach(dimension => {
+    s += `<line x1="${X(Number(dimension.x1))}" y1="${Y(Number(dimension.y1))}"
+            x2="${X(Number(dimension.x2))}" y2="${Y(Number(dimension.y2))}"
+            stroke="#1f6fd0" stroke-width="1" stroke-dasharray="4 3"/>`;
   });
 
   if (path.length > 1) {
@@ -443,9 +534,10 @@ function analyticsSection(a) {
 async function pageOverview() {
   const q = rangeQuery();
   const isLead = S.user && (S.user.role === 'sale_lead' || S.user.role === 'admin');
-  const [ov, dev, live, ana] = await Promise.all([
+  const [ov, dev, live, ana, drawing] = await Promise.all([
     requestApi('/api/overview' + q), requestApi('/api/devices'), requestApi('/api/live?since=0'),
     isLead ? requestApi('/api/analytics' + q).catch(() => null) : Promise.resolve(null),
+    loadPlanDrawing().catch(() => ({})),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
@@ -504,7 +596,7 @@ async function pageOverview() {
 
         <div class="card"><div class="card-head">
           <span class="card-title">แผนผังโครงการ</span></div>
-          <div class="card-body">${planSVG({ tags })}</div>
+          <div class="card-body">${planSVG({ ...drawing, tags })}</div>
         </div>
       </div>
     </div>`);
@@ -513,8 +605,9 @@ async function pageOverview() {
 
 async function pageProject() {
   const q = rangeQuery();
-  const [live, dev, vis] = await Promise.all([
+  const [live, dev, vis, drawing] = await Promise.all([
     requestApi('/api/live?since=0'), requestApi('/api/devices'), requestApi('/api/visits' + q),
+    loadPlanDrawing().catch(() => ({})),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
@@ -533,7 +626,7 @@ async function pageProject() {
         ${filterCard(['province', 'project', 'plan', 'dates'])}
         <div class="card"><div class="card-head">
           <span class="card-title">แผนผังโครงการ</span></div>
-          <div class="card-body">${planSVG({ tags, anchorStatus })}</div></div>
+          <div class="card-body">${planSVG({ ...drawing, tags, anchorStatus })}</div></div>
       </div>
       <div class="stack">
         ${tagIds.length ? tagIds.map(tid => {
@@ -703,6 +796,7 @@ async function pageVisits() {
 async function pageVisitDetail(key) {
   const d = await requestApi('/api/visit?key=' + encodeURIComponent(key));
   if (d.error) { render(`<div class="card"><div class="card-body">${esc(d.error)}</div></div>`); return; }
+  const drawing = await loadPlanDrawing(d.plan_id || selectedPlanId()).catch(() => ({}));
   /* The server decides this, not the browser -- a hidden button is not a
      permission. It is echoed back so the two can never disagree. */
   const canEdit = !!d.can_edit;
@@ -784,7 +878,7 @@ async function pageVisitDetail(key) {
         </div>
         <div class="card"><div class="card-head">
           <span class="card-title">เส้นทางการเดิน</span></div>
-          <div class="card-body">${planSVG({ path: d.path })}</div></div>
+          <div class="card-body">${planSVG({ ...drawing, path: d.path })}</div></div>
       </div>
     </div>`);
 
@@ -871,11 +965,16 @@ async function pageDevices() {
 }
 
 async function pageDeviceTracking() {
-  const [dev, live] = await Promise.all([requestApi('/api/devices'), requestApi('/api/live?since=0')]);
+  const [dev, live, drawing] = await Promise.all([
+    requestApi('/api/devices'),
+    requestApi('/api/live?since=0'),
+    loadPlanDrawing().catch(() => ({})),
+  ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
   const anchorStatus = Object.fromEntries(dev.anchors.map(a => [a.anchor_id, a.on]));
   S.live.anchorStatus = anchorStatus;
+  S.live.planDrawing = drawing;
 
   render(`
     <div class="page-head"><h1>ติดตามอุปกรณ์</h1>
@@ -898,7 +997,7 @@ async function pageDeviceTracking() {
         <div class="card"><div class="card-head">
           <span class="card-title">แผนผังโครงการ</span>
           <span class="page-sub" id="live-clock"></span></div>
-          <div class="card-body" id="live-plan">${planSVG({ tags, anchorStatus })}</div></div>
+          <div class="card-body" id="live-plan">${planSVG({ ...drawing, tags, anchorStatus })}</div></div>
         <div class="cols cols-2">
           <div class="card"><div class="card-head"><span class="card-title">Anchor Status</span></div>
             <div class="card-body flush"><div class="table-wrap"><table class="data">
@@ -937,7 +1036,7 @@ function renderLiveSnapshot(live, channel) {
   if (!plan) return stopLive();
   const tags = Object.entries(live.tags || {}).map(([id, tag]) =>
     Object.assign({ tag_id: id, label: tag.sale_name || id }, tag));
-  plan.innerHTML = planSVG({ tags, anchorStatus: S.live.anchorStatus || {} });
+  plan.innerHTML = planSVG({ ...(S.live.planDrawing || {}), tags, anchorStatus: S.live.anchorStatus || {} });
   const clock = $('#live-clock');
   if (clock) clock.textContent = `${channel} · อัปเดตล่าสุด ${fmtTime(live.now)}`;
 }

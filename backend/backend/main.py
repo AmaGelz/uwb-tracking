@@ -84,7 +84,7 @@ class PlanCreate(PlanEditorModel):
     name: NonEmptyText
     width_m: float = Field(default=20.0, gt=0)
     height_m: float = Field(default=20.0, gt=0)
-    is_active: bool = False
+    is_active: bool = True
     version: int = Field(default=1, ge=1)
 
 
@@ -372,10 +372,19 @@ def bootstrap(x_session: str | None = Header(default=None)):
     ]
     customers = db.fetchall("SELECT id, name FROM customers ORDER BY name")
 
-    live_id = q.live_project_id()
-    zones_rows = q.get_zones(live_id) if live_id else []
+    live_project = next(
+        (project for project in projects if any(plan.get("live") for plan in project.get("plans", []))),
+        projects[0] if projects else None,
+    )
+    live_id = live_project["project_id"] if live_project else None
+    live_plan = next(
+        (plan for plan in (live_project or {}).get("plans", []) if plan.get("live")),
+        ((live_project or {}).get("plans") or [None])[0],
+    )
+    live_plan_id = live_plan.get("plan_id") if live_plan else None
+    zones_rows = q.get_plan_zones(live_plan_id) if live_plan_id else (q.get_zones(live_id) if live_id else [])
     zones = [{"name": z["name"], "x": [z["x_min"], z["x_max"]], "y": [z["y_min"], z["y_max"]]} for z in zones_rows]
-    anchors_rows = q.get_anchors(live_id) if live_id else []
+    anchors_rows = q.get_plan_anchors(live_plan_id) if live_plan_id else (q.get_anchors(live_id) if live_id else [])
     anchors = {a["anchor_id"]: [a["x"], a["y"]] for a in anchors_rows}
 
     return {
@@ -387,6 +396,7 @@ def bootstrap(x_session: str | None = Header(default=None)):
         "zones": zones,
         "anchors": anchors,
         "live_project_id": live_id,
+        "live_plan_id": live_plan_id,
         "deal_statuses": q.DEAL_STATUSES,
     }
 

@@ -70,7 +70,16 @@ def get_projects() -> list[dict[str, Any]]:
         """
     )
     for project in projects:
-        project["plans"] = [{"plan_id": project["plan_id"], "name": project["plan_name"], "live": True}]
+        project["plans"] = [
+            {**plan, "live": bool(plan["is_active"])}
+            for plan in get_plans(project["project_id"])
+        ]
+        if not project["plans"] and project.get("plan_id"):
+            project["plans"] = [{
+                "plan_id": project["plan_id"],
+                "name": project["plan_name"],
+                "live": True,
+            }]
     return projects
 
 
@@ -112,8 +121,30 @@ def get_plan(plan_id: str) -> dict[str, Any] | None:
     )
 
 
+def sync_project_plan(project_id: str) -> None:
+    """Keep legacy project plan columns aligned with the canonical plans table."""
+    db.execute(
+        """
+        UPDATE projects AS project
+        SET plan_id = selected.id,
+            plan_name = selected.name,
+            width_m = selected.width_m,
+            height_m = selected.height_m
+        FROM (
+            SELECT id, name, width_m, height_m
+            FROM plans
+            WHERE project_id = %s
+            ORDER BY is_active DESC, updated_at DESC, id
+            LIMIT 1
+        ) AS selected
+        WHERE project.id = %s
+        """,
+        (project_id, project_id),
+    )
+
+
 def create_plan(project_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    return db.fetchone(
+    plan = db.fetchone(
         """
         WITH inserted AS (
             INSERT INTO plans (
@@ -150,6 +181,9 @@ def create_plan(project_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
             data.get("is_active", False), data.get("version", 1),
         ),
     )
+    if plan:
+        sync_project_plan(project_id)
+    return plan
 
 
 def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
@@ -162,7 +196,7 @@ def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
     params = [value for _key, value in changes]
     params.append(plan_id)
 
-    return db.fetchone(
+    plan = db.fetchone(
         f"""
         WITH updated AS (
             UPDATE plans
@@ -193,6 +227,9 @@ def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         """,
         tuple(params),
     )
+    if plan:
+        sync_project_plan(plan["project_id"])
+    return plan
 
 
 def get_plan_objects(plan_id: str) -> list[dict[str, Any]]:

@@ -45,11 +45,23 @@
         <h1 id="plan-title">Plan Editor</h1>
         <div class="page-sub" id="plan-meta">พิกัดทั้งหมดใช้หน่วยเมตร</div>
       </div>
-      <div class="editor-load-plan">
-        <label class="label" for="plan-id-input">Plan ID</label>
-        <div class="btn-row">
-          <input class="control" id="plan-id-input" autocomplete="off" placeholder="PLAN01">
-          <button class="btn" id="load-plan" type="button">โหลด</button>
+      <div class="editor-plan-picker" aria-label="เลือกโครงการและแปลน">
+        <label class="editor-picker-field" for="project-select">
+          <span class="label">โครงการ</span>
+          <select class="control" id="project-select">
+            <option value="">กำลังโหลดโครงการ...</option>
+          </select>
+        </label>
+        <label class="editor-picker-field" for="plan-select">
+          <span class="label">แปลน</span>
+          <select class="control" id="plan-select" disabled>
+            <option value="">เลือกแปลน</option>
+          </select>
+        </label>
+        <div class="editor-plan-actions">
+          <button class="btn" id="new-plan" type="button">เพิ่มแปลน</button>
+          <button class="btn" id="edit-plan" type="button" disabled>แก้ไข</button>
+          <button class="btn btn-primary" id="save-plan" type="button" disabled>บันทึก</button>
         </div>
       </div>
     </div>
@@ -117,6 +129,40 @@
       <aside class="card editor-inspector" aria-label="ข้อมูลวัตถุ">
         <div class="card-head"><span class="card-title">Properties</span></div>
         <div class="card-body">
+          <div class="inspector-section plan-settings" id="plan-settings" hidden>
+            <span class="label">Plan properties</span>
+            <div class="field">
+              <label class="label" for="plan-id-input">Plan ID</label>
+              <input class="control" id="plan-id-input" maxlength="100" autocomplete="off" placeholder="เช่น PLAN-01">
+            </div>
+            <div class="field">
+              <label class="label" for="plan-name-input">ชื่อแปลน</label>
+              <input class="control" id="plan-name-input" maxlength="200" autocomplete="off" placeholder="เช่น ชั้น 1">
+            </div>
+            <div class="field-row">
+              <label class="sub"><span>ความกว้าง</span>
+                <div class="input-with-unit">
+                  <input class="control" id="plan-width-input" type="number" min="0.01" step="0.01">
+                  <span>m</span>
+                </div>
+              </label>
+              <label class="sub"><span>ความสูง</span>
+                <div class="input-with-unit">
+                  <input class="control" id="plan-height-input" type="number" min="0.01" step="0.01">
+                  <span>m</span>
+                </div>
+              </label>
+            </div>
+            <div class="field-row plan-version-row">
+              <label class="sub"><span>Version</span>
+                <input class="control" id="plan-version-input" type="number" min="1" step="1">
+              </label>
+              <label class="plan-active-option" for="plan-active-input">
+                <input id="plan-active-input" type="checkbox">
+                <span>ใช้แปลนนี้ในหน้าติดตาม</span>
+              </label>
+            </div>
+          </div>
           <div class="inspector-section">
             <span class="label">Selection</span>
             <div id="selection-summary" class="selection-summary">ยังไม่ได้เลือกวัตถุ</div>
