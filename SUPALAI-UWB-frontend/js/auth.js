@@ -72,8 +72,13 @@
 
   function setupInvitedPassword() {
     const form = q('#signin-form');
-    const emailField = q('#si-email')?.closest('.field');
+    const emailInput = q('#si-email');
+    const emailField = emailInput?.closest('.field');
     if (emailField) emailField.hidden = true;
+    if (emailInput) {
+      emailInput.required = false;
+      emailInput.disabled = true;
+    }
     q('.signin h2').textContent = 'Set your password';
     const password = q('#si-pw');
     password.autocomplete = 'new-password';
