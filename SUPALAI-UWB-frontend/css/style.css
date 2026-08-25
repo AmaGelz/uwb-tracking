@@ -427,6 +427,7 @@ td.dim { color: var(--muted); }
 .google-wrap { display: flex; justify-content: center; min-height: 44px; }
 .google-wrap > div { max-width: 100%; }
 .google-wrap .google-auth-button { width: 100%; }
+.signin-forgot { display: block; margin: 10px auto 0; }
 .google-disabled { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 11px 12px; text-align: center; color: var(--muted); font-size: 12px; }
 .signin-hint { margin-top: 18px; font-size: 12px; color: var(--muted); text-align: center; line-height: 1.75; }
 .err {
