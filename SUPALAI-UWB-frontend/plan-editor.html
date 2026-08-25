@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plan Editor | SUPALAI</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/plan-editor.css">
+</head>
+<body class="plan-editor-page">
+  <header class="header">
+    <a class="brand" href="dashboard.html#/overview" aria-label="SUPALAI dashboard">
+      <span class="brand-mark">S</span>SUPALAI
+    </a>
+    <div class="header-right">
+      <div class="who">
+        <b id="editor-user-name">กำลังโหลด...</b>
+        <span id="editor-user-meta">Plan Editor</span>
+      </div>
+      <div class="avatar" id="editor-avatar">?</div>
+      <button class="linkish" id="editor-logout" type="button">Logout</button>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="เมนูหลัก">
+    <div class="rail-group">
+      <div class="rail-title">เมนูหลัก</div>
+      <a href="dashboard.html#/overview">ข้อมูลภาพรวม</a>
+      <a href="dashboard.html#/project">ติดตามรายโครงการ</a>
+      <a href="dashboard.html#/sales">สถานะพนักงานขาย</a>
+      <a href="dashboard.html#/visits">บันทึกการเยี่ยมชม</a>
+    </div>
+    <div class="rail-group">
+      <div class="rail-title">ตั้งค่า</div>
+      <a class="on" href="plan-editor.html" aria-current="page">Plan Editor</a>
+      <a href="dashboard.html#/devices">ตั้งค่าอุปกรณ์</a>
+      <a href="dashboard.html#/device-tracking">ติดตามอุปกรณ์</a>
+    </div>
+  </nav>
+
+  <main class="main editor-main" id="editor-root">
+    <div class="page-head editor-page-head">
+      <div>
+        <h1 id="plan-title">Plan Editor</h1>
+        <div class="page-sub" id="plan-meta">พิกัดทั้งหมดใช้หน่วยเมตร</div>
+      </div>
+      <div class="editor-load-plan">
+        <label class="label" for="plan-id-input">Plan ID</label>
+        <div class="btn-row">
+          <input class="control" id="plan-id-input" autocomplete="off" placeholder="PLAN01">
+          <button class="btn" id="load-plan" type="button">โหลด</button>
+        </div>
+      </div>
+    </div>
+
+    <section class="card editor-toolbar" aria-label="เครื่องมือวาดแปลน">
+      <div class="tool-group" role="toolbar" aria-label="Drawing tools">
+        <button class="tool-btn is-active" id="tool-select" data-tool="select" type="button" aria-pressed="true">Select</button>
+        <button class="tool-btn" id="tool-line" data-tool="line" type="button" aria-pressed="false">Line</button>
+        <button class="tool-btn" id="tool-rectangle" data-tool="rectangle" type="button" aria-pressed="false">Rectangle</button>
+        <button class="tool-btn" id="tool-zone" data-tool="zone" type="button" aria-pressed="false">Zone</button>
+        <button class="tool-btn" id="tool-anchor" data-tool="anchor" type="button" aria-pressed="false">Anchor</button>
+        <button class="tool-btn" id="tool-dimension" data-tool="dimension" type="button" aria-pressed="false">Dimension</button>
+      </div>
+      <div class="tool-group tool-actions" role="toolbar" aria-label="Editor actions">
+        <button class="tool-btn tool-danger" id="tool-delete" type="button">Delete</button>
+        <button class="tool-btn is-active" id="tool-grid" type="button" aria-pressed="true">Grid</button>
+        <button class="tool-btn is-active" id="tool-snap" type="button" aria-pressed="true">Snap</button>
+        <button class="tool-btn" id="tool-zoom-out" type="button" aria-label="Zoom out">−</button>
+        <button class="tool-btn" id="tool-zoom-in" type="button" aria-label="Zoom in">+</button>
+        <button class="tool-btn" id="tool-fit" type="button">Fit</button>
+      </div>
+    </section>
+
+    <div class="editor-layout">
+      <section class="card editor-canvas-card">
+        <div class="card-head editor-canvas-head">
+          <div>
+            <span class="card-title">Drawing canvas</span>
+            <span class="editor-unit-badge">m</span>
+          </div>
+          <div class="editor-canvas-help">ล้อเมาส์: Zoom · Space/ปุ่มกลางลาก: Pan · Esc: ยกเลิก</div>
+        </div>
+        <div class="editor-canvas-wrap" id="canvas-wrap">
+          <svg id="editor-svg" role="img" aria-label="พื้นที่แก้ไขแปลนในหน่วยเมตร" tabindex="0">
+            <defs>
+              <pattern id="minor-grid-pattern" patternUnits="userSpaceOnUse" width="1" height="1">
+                <path id="minor-grid-path" d="M 1 0 L 0 0 0 1" fill="none"></path>
+              </pattern>
+              <pattern id="major-grid-pattern" patternUnits="userSpaceOnUse" width="5" height="5">
+                <path id="major-grid-path" d="M 5 0 L 0 0 0 5" fill="none"></path>
+              </pattern>
+            </defs>
+            <rect id="canvas-background" class="canvas-background"></rect>
+            <g id="grid-layer" aria-hidden="true">
+              <rect id="minor-grid-fill" fill="url(#minor-grid-pattern)"></rect>
+              <rect id="major-grid-fill" fill="url(#major-grid-pattern)"></rect>
+            </g>
+            <g id="plan-boundary-layer"></g>
+            <g id="zone-layer"></g>
+            <g id="object-layer"></g>
+            <g id="dimension-layer"></g>
+            <g id="anchor-layer"></g>
+            <g id="draft-layer" pointer-events="none"></g>
+          </svg>
+          <div class="editor-loading" id="editor-loading" role="status">กำลังโหลดแปลน...</div>
+        </div>
+        <div class="editor-statusbar">
+          <span id="editor-message">Select: คลิกวัตถุเพื่อเลือก</span>
+          <span class="status-spacer"></span>
+          <span id="cursor-coords">X 0.00 · Y 0.00 m</span>
+          <span id="zoom-level">100%</span>
+        </div>
+      </section>
+
+      <aside class="card editor-inspector" aria-label="ข้อมูลวัตถุ">
+        <div class="card-head"><span class="card-title">Properties</span></div>
+        <div class="card-body">
+          <div class="inspector-section">
+            <span class="label">Selection</span>
+            <div id="selection-summary" class="selection-summary">ยังไม่ได้เลือกวัตถุ</div>
+            <dl class="selection-details" id="selection-details"></dl>
+          </div>
+          <div class="inspector-section">
+            <label class="label" for="grid-size">Grid / Snap spacing</label>
+            <div class="input-with-unit">
+              <input class="control" id="grid-size" type="number" min="0.05" step="0.05" value="1">
+              <span>m</span>
+            </div>
+          </div>
+          <div class="inspector-section inspector-counts" id="entity-counts">
+            <div><span>Objects</span><b>0</b></div>
+            <div><span>Zones</span><b>0</b></div>
+            <div><span>Anchors</span><b>0</b></div>
+            <div><span>Dimensions</span><b>0</b></div>
+          </div>
+          <div class="hint editor-hint" id="editor-role-hint">
+            การแก้ไขแปลนต้องใช้สิทธิ์ admin
+          </div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/plan-editor.js"></script>
+</body>
+</html>

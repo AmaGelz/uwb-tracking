@@ -191,6 +191,7 @@ const MENU = [
     { id: 'visits', label: 'บันทึกการเยี่ยมชมโครงการ' },
   ] },
   { group: 'ตั้งค่า', roles: ['admin'], items: [
+    { id: 'plan-editor', label: 'Plan Editor', href: 'plan-editor.html' },
     { id: 'devices', label: 'ตั้งค่าอุปกรณ์' },
     { id: 'device-tracking', label: 'ติดตามอุปกรณ์' },
   ] },
@@ -206,7 +207,7 @@ function shell(inner) {
   const rail = MENU.filter(g => !g.roles || g.roles.includes(role)).map(g => `
     <div class="rail-group">
       <div class="rail-title">${esc(g.group)}</div>
-      ${g.items.map(i => `<a href="#/${i.id}" class="${S.route === i.id ? 'on' : ''}">${esc(i.label)}</a>`).join('')}
+      ${g.items.map(i => `<a href="${i.href || '#/' + i.id}" class="${S.route === i.id ? 'on' : ''}">${esc(i.label)}</a>`).join('')}
     </div>`).join('');
 
   return `

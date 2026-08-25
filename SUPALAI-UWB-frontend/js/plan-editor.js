@@ -1,0 +1,1041 @@
+/* SUPALAI Plan Editor
+ *
+ * The model, pointer coordinates, viewport and snap spacing in this file are
+ * all metres. CSS pixels are used only to keep handles, labels and hit targets
+ * readable on screen; they never become persisted geometry.
+ */
+'use strict';
+
+(() => {
+  const { api, state: session } = window.SUPALAI_API;
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const EDIT_TOOLS = new Set(['line', 'rectangle', 'zone', 'anchor', 'dimension']);
+
+  const ui = {
+    svg: document.getElementById('editor-svg'),
+    canvasWrap: document.getElementById('canvas-wrap'),
+    background: document.getElementById('canvas-background'),
+    gridLayer: document.getElementById('grid-layer'),
+    minorGrid: document.getElementById('minor-grid-fill'),
+    majorGrid: document.getElementById('major-grid-fill'),
+    minorPattern: document.getElementById('minor-grid-pattern'),
+    majorPattern: document.getElementById('major-grid-pattern'),
+    minorPath: document.getElementById('minor-grid-path'),
+    majorPath: document.getElementById('major-grid-path'),
+    boundaryLayer: document.getElementById('plan-boundary-layer'),
+    zoneLayer: document.getElementById('zone-layer'),
+    objectLayer: document.getElementById('object-layer'),
+    dimensionLayer: document.getElementById('dimension-layer'),
+    anchorLayer: document.getElementById('anchor-layer'),
+    draftLayer: document.getElementById('draft-layer'),
+    loading: document.getElementById('editor-loading'),
+    message: document.getElementById('editor-message'),
+    cursor: document.getElementById('cursor-coords'),
+    zoom: document.getElementById('zoom-level'),
+    planTitle: document.getElementById('plan-title'),
+    planMeta: document.getElementById('plan-meta'),
+    planInput: document.getElementById('plan-id-input'),
+    loadPlan: document.getElementById('load-plan'),
+    selectionSummary: document.getElementById('selection-summary'),
+    selectionDetails: document.getElementById('selection-details'),
+    counts: document.getElementById('entity-counts'),
+    gridSize: document.getElementById('grid-size'),
+    roleHint: document.getElementById('editor-role-hint'),
+    userName: document.getElementById('editor-user-name'),
+    userMeta: document.getElementById('editor-user-meta'),
+    avatar: document.getElementById('editor-avatar'),
+    logout: document.getElementById('editor-logout'),
+  };
+
+  const state = {
+    plan: null,
+    objects: [],
+    zones: [],
+    anchors: [],
+    dimensions: [],
+    tool: 'select',
+    selected: null,
+    draft: null,
+    drag: null,
+    pan: null,
+    spaceDown: false,
+    gridVisible: true,
+    snapEnabled: true,
+    gridStep: 1,
+    canEdit: false,
+    busy: false,
+    view: { x: -1, y: -1, width: 22, height: 22 },
+    fitWidth: 22,
+  };
+
+  function svgElement(tag, attrs = {}) {
+    const element = document.createElementNS(SVG_NS, tag);
+    for (const [name, value] of Object.entries(attrs)) {
+      if (value !== null && value !== undefined) element.setAttribute(name, String(value));
+    }
+    return element;
+  }
+
+  function clearLayer(layer) {
+    while (layer.firstChild) layer.removeChild(layer.firstChild);
+  }
+
+  function setMessage(text, kind = '') {
+    ui.message.textContent = text;
+    ui.message.className = kind ? `is-${kind}` : '';
+  }
+
+  function showLoading(text, isError = false) {
+    ui.loading.hidden = false;
+    ui.loading.textContent = text;
+    ui.loading.classList.toggle('is-error', isError);
+  }
+
+  function hideLoading() {
+    ui.loading.hidden = true;
+    ui.loading.classList.remove('is-error');
+  }
+
+  function widthMetres() {
+    return Math.max(0.01, Number(state.plan?.width_m) || 20);
+  }
+
+  function heightMetres() {
+    return Math.max(0.01, Number(state.plan?.height_m) || 20);
+  }
+
+  // World coordinates are Cartesian metres (Y grows upward). SVG Y grows
+  // downward, so this is the only axis conversion used by render functions.
+  const svgY = worldY => heightMetres() - worldY;
+  const worldY = svgCoordinateY => heightMetres() - svgCoordinateY;
+
+  function canvasRect() {
+    return ui.svg.getBoundingClientRect();
+  }
+
+  function metresPerPixel() {
+    const rect = canvasRect();
+    return state.view.width / Math.max(1, rect.width);
+  }
+
+  function pointerMetres(event, applySnap = false) {
+    const rect = canvasRect();
+    const sx = state.view.x + ((event.clientX - rect.left) / Math.max(1, rect.width)) * state.view.width;
+    const sy = state.view.y + ((event.clientY - rect.top) / Math.max(1, rect.height)) * state.view.height;
+    const point = { x: sx, y: worldY(sy) };
+    return applySnap ? snapPoint(point) : point;
+  }
+
+  function snapPoint(point) {
+    if (!state.snapEnabled) return point;
+    const step = state.gridStep;
+    return {
+      x: Math.round(point.x / step) * step,
+      y: Math.round(point.y / step) * step,
+    };
+  }
+
+  function pointString(points) {
+    return points.map(point => `${point.x},${svgY(point.y)}`).join(' ');
+  }
+
+  function pointsFromGeometry(geometry) {
+    if (!geometry || !Array.isArray(geometry.points)) return [];
+    return geometry.points
+      .filter(point => Array.isArray(point) && point.length >= 2)
+      .map(point => ({ x: Number(point[0]), y: Number(point[1]) }))
+      .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
+  }
+
+  function geometryFromPoints(type, points) {
+    return { type, points: points.map(point => [point.x, point.y]) };
+  }
+
+  function entityGroup(kind, id) {
+    const group = svgElement('g', {
+      class: `editor-entity${isSelected(kind, id) ? ' is-selected' : ''}`,
+      'data-kind': kind,
+      'data-id': id,
+    });
+    return group;
+  }
+
+  function isSelected(kind, id) {
+    return Boolean(
+      state.selected
+      && state.selected.kind === kind
+      && String(state.selected.id) === String(id)
+    );
+  }
+
+  function visualScale() {
+    const unit = metresPerPixel();
+    return {
+      label: unit * 11,
+      anchor: unit * 7,
+      handle: unit * 4,
+      tick: unit * 5,
+      offset: unit * 8,
+    };
+  }
+
+  function addLabel(group, text, x, y, anchor = 'start') {
+    if (!text) return;
+    const scale = visualScale();
+    const label = svgElement('text', {
+      class: 'entity-label',
+      x,
+      y,
+      'font-size': scale.label,
+      'text-anchor': anchor,
+    });
+    label.textContent = text;
+    group.appendChild(label);
+  }
+
+  function renderBoundary() {
+    clearLayer(ui.boundaryLayer);
+    const boundary = svgElement('rect', {
+      class: 'plan-boundary',
+      x: 0,
+      y: 0,
+      width: widthMetres(),
+      height: heightMetres(),
+    });
+    ui.boundaryLayer.appendChild(boundary);
+
+    const scale = visualScale();
+    const origin = svgElement('text', {
+      class: 'plan-axis',
+      x: scale.offset,
+      y: heightMetres() - scale.offset,
+      'font-size': scale.label * 0.9,
+    });
+    origin.textContent = '0, 0 m';
+    ui.boundaryLayer.appendChild(origin);
+  }
+
+  function renderObjects() {
+    clearLayer(ui.objectLayer);
+    const scale = visualScale();
+    state.objects.forEach(object => {
+      const id = object.object_id;
+      const group = entityGroup('object', id);
+      const geometry = object.geometry || {};
+      const type = String(geometry.type || object.object_type || '').toLowerCase();
+      const points = pointsFromGeometry(geometry);
+      let shape = null;
+      let labelX = 0;
+      let labelY = 0;
+
+      if (type === 'rectangle' && Number.isFinite(Number(geometry.x))) {
+        const x = Number(geometry.x);
+        const y = Number(geometry.y);
+        const width = Math.abs(Number(geometry.width) || 0);
+        const height = Math.abs(Number(geometry.height) || 0);
+        shape = svgElement('rect', {
+          class: 'editor-shape object-shape object-rectangle',
+          x,
+          y: svgY(y + height),
+          width,
+          height,
+        });
+        labelX = x + width / 2;
+        labelY = svgY(y + height / 2) - scale.offset;
+      } else if (points.length >= 2) {
+        const closed = type === 'polygon';
+        shape = svgElement(closed ? 'polygon' : 'polyline', {
+          class: 'editor-shape object-shape',
+          points: pointString(points),
+          fill: closed ? 'rgba(71,84,103,.04)' : 'none',
+        });
+        labelX = points.reduce((sum, point) => sum + point.x, 0) / points.length;
+        labelY = svgY(points.reduce((sum, point) => sum + point.y, 0) / points.length) - scale.offset;
+      }
+
+      if (!shape) return;
+      group.appendChild(shape);
+      addLabel(group, object.label || object.object_type, labelX, labelY, 'middle');
+      ui.objectLayer.appendChild(group);
+    });
+  }
+
+  function zonePoints(zone) {
+    const geometryPoints = pointsFromGeometry(zone.geometry);
+    if (geometryPoints.length >= 3) return geometryPoints;
+    return [
+      { x: Number(zone.x_min), y: Number(zone.y_min) },
+      { x: Number(zone.x_max), y: Number(zone.y_min) },
+      { x: Number(zone.x_max), y: Number(zone.y_max) },
+      { x: Number(zone.x_min), y: Number(zone.y_max) },
+    ];
+  }
+
+  function renderZones() {
+    clearLayer(ui.zoneLayer);
+    const scale = visualScale();
+    state.zones.forEach(zone => {
+      const points = zonePoints(zone);
+      const group = entityGroup('zone', zone.zone_id);
+      group.appendChild(svgElement('polygon', {
+        class: 'editor-shape zone-shape',
+        points: pointString(points),
+      }));
+      const x = Math.min(...points.map(point => point.x)) + scale.offset;
+      const y = svgY(Math.max(...points.map(point => point.y))) + scale.label + scale.offset;
+      addLabel(group, zone.name, x, y);
+      ui.zoneLayer.appendChild(group);
+    });
+  }
+
+  function renderAnchors() {
+    clearLayer(ui.anchorLayer);
+    const scale = visualScale();
+    state.anchors.forEach(anchor => {
+      const x = Number(anchor.x);
+      const y = svgY(Number(anchor.y));
+      const size = scale.anchor;
+      const group = entityGroup('anchor', anchor.anchor_id);
+      group.appendChild(svgElement('path', {
+        class: 'editor-shape anchor-shape',
+        d: `M ${x} ${y - size} L ${x + size} ${y} L ${x} ${y + size} L ${x - size} ${y} Z`,
+      }));
+      addLabel(group, anchor.anchor_id, x + size + scale.offset * 0.5, y - size);
+      ui.anchorLayer.appendChild(group);
+    });
+  }
+
+  function renderDimensions() {
+    clearLayer(ui.dimensionLayer);
+    const scale = visualScale();
+    state.dimensions.forEach(dimension => {
+      const start = { x: Number(dimension.x1), y: Number(dimension.y1) };
+      const end = { x: Number(dimension.x2), y: Number(dimension.y2) };
+      const group = entityGroup('dimension', dimension.dimension_id);
+      group.appendChild(svgElement('line', {
+        class: 'editor-shape dimension-shape',
+        x1: start.x,
+        y1: svgY(start.y),
+        x2: end.x,
+        y2: svgY(end.y),
+      }));
+      for (const point of [start, end]) {
+        group.appendChild(svgElement('line', {
+          class: 'dimension-tick',
+          x1: point.x,
+          y1: svgY(point.y) - scale.tick,
+          x2: point.x,
+          y2: svgY(point.y) + scale.tick,
+        }));
+      }
+      const label = dimension.label || `${Number(dimension.length_m).toFixed(2)} m`;
+      addLabel(
+        group,
+        label,
+        (start.x + end.x) / 2,
+        svgY((start.y + end.y) / 2) - scale.offset,
+        'middle',
+      );
+      ui.dimensionLayer.appendChild(group);
+    });
+  }
+
+  function renderDraft() {
+    clearLayer(ui.draftLayer);
+    if (!state.draft) return;
+    const draft = state.draft;
+    const scale = visualScale();
+
+    if (draft.kind === 'zone') {
+      const points = draft.cursor ? [...draft.points, draft.cursor] : draft.points;
+      if (points.length >= 2) {
+        ui.draftLayer.appendChild(svgElement('polyline', {
+          class: 'draft-shape',
+          points: pointString(points),
+          fill: 'none',
+        }));
+      }
+      draft.points.forEach(point => {
+        ui.draftLayer.appendChild(svgElement('circle', {
+          class: 'draft-handle', cx: point.x, cy: svgY(point.y), r: scale.handle,
+        }));
+      });
+      return;
+    }
+
+    if (!draft.start || !draft.end) return;
+    const x = Math.min(draft.start.x, draft.end.x);
+    const y = Math.min(draft.start.y, draft.end.y);
+    const width = Math.abs(draft.end.x - draft.start.x);
+    const height = Math.abs(draft.end.y - draft.start.y);
+    if (draft.kind === 'rectangle') {
+      ui.draftLayer.appendChild(svgElement('rect', {
+        class: 'draft-shape', x, y: svgY(y + height), width, height,
+      }));
+    } else {
+      ui.draftLayer.appendChild(svgElement('line', {
+        class: 'draft-shape',
+        x1: draft.start.x,
+        y1: svgY(draft.start.y),
+        x2: draft.end.x,
+        y2: svgY(draft.end.y),
+      }));
+    }
+  }
+
+  function renderScene() {
+    if (!state.plan) return;
+    renderBoundary();
+    renderZones();
+    renderObjects();
+    renderDimensions();
+    renderAnchors();
+    renderDraft();
+    updateInspector();
+  }
+
+  function updateGrid() {
+    const step = state.gridStep;
+    const major = step * 5;
+    ui.minorPattern.setAttribute('width', step);
+    ui.minorPattern.setAttribute('height', step);
+    ui.minorPath.setAttribute('d', `M ${step} 0 L 0 0 0 ${step}`);
+    ui.majorPattern.setAttribute('width', major);
+    ui.majorPattern.setAttribute('height', major);
+    ui.majorPath.setAttribute('d', `M ${major} 0 L 0 0 0 ${major}`);
+
+    for (const fill of [ui.background, ui.minorGrid, ui.majorGrid]) {
+      fill.setAttribute('x', state.view.x);
+      fill.setAttribute('y', state.view.y);
+      fill.setAttribute('width', state.view.width);
+      fill.setAttribute('height', state.view.height);
+    }
+    ui.gridLayer.hidden = !state.gridVisible;
+  }
+
+  function applyViewBox(rerender = false) {
+    const view = state.view;
+    ui.svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.width} ${view.height}`);
+    updateGrid();
+    const percent = Math.round((state.fitWidth / view.width) * 100);
+    ui.zoom.textContent = `${percent}%`;
+    if (rerender) renderScene();
+  }
+
+  function fitView() {
+    if (!state.plan) return;
+    const planWidth = widthMetres();
+    const planHeight = heightMetres();
+    const margin = Math.max(0.5, Math.max(planWidth, planHeight) * 0.06);
+    let width = planWidth + margin * 2;
+    let height = planHeight + margin * 2;
+    const rect = canvasRect();
+    const canvasAspect = Math.max(0.2, rect.width / Math.max(1, rect.height));
+    if (width / height > canvasAspect) height = width / canvasAspect;
+    else width = height * canvasAspect;
+    state.view = {
+      x: planWidth / 2 - width / 2,
+      y: planHeight / 2 - height / 2,
+      width,
+      height,
+    };
+    state.fitWidth = width;
+    applyViewBox(true);
+  }
+
+  function adjustViewToCanvas() {
+    if (!state.plan) return;
+    const rect = canvasRect();
+    if (!rect.width || !rect.height) return;
+    const centerY = state.view.y + state.view.height / 2;
+    state.view.height = state.view.width / (rect.width / rect.height);
+    state.view.y = centerY - state.view.height / 2;
+    applyViewBox(true);
+  }
+
+  function zoomAt(factor, clientX = null, clientY = null) {
+    if (!state.plan) return;
+    const rect = canvasRect();
+    const xRatio = clientX == null ? 0.5 : (clientX - rect.left) / Math.max(1, rect.width);
+    const yRatio = clientY == null ? 0.5 : (clientY - rect.top) / Math.max(1, rect.height);
+    const anchorX = state.view.x + xRatio * state.view.width;
+    const anchorY = state.view.y + yRatio * state.view.height;
+    const minWidth = Math.max(0.05, widthMetres() * 0.015);
+    const maxWidth = Math.max(100, widthMetres() * 30);
+    const width = Math.min(maxWidth, Math.max(minWidth, state.view.width * factor));
+    const height = width / Math.max(0.2, rect.width / Math.max(1, rect.height));
+    state.view = {
+      x: anchorX - xRatio * width,
+      y: anchorY - yRatio * height,
+      width,
+      height,
+    };
+    applyViewBox(true);
+  }
+
+  function entityBySelection() {
+    if (!state.selected) return null;
+    const { kind, id } = state.selected;
+    const collection = {
+      object: state.objects,
+      zone: state.zones,
+      anchor: state.anchors,
+      dimension: state.dimensions,
+    }[kind];
+    const key = { object: 'object_id', zone: 'zone_id', anchor: 'anchor_id', dimension: 'dimension_id' }[kind];
+    return collection?.find(entity => String(entity[key]) === String(id)) || null;
+  }
+
+  function describeSelection(entity) {
+    if (!entity || !state.selected) return {};
+    const kind = state.selected.kind;
+    if (kind === 'anchor') {
+      return {
+        ID: entity.anchor_id,
+        X: `${Number(entity.x).toFixed(3)} m`,
+        Y: `${Number(entity.y).toFixed(3)} m`,
+        Z: entity.z == null ? '—' : `${Number(entity.z).toFixed(3)} m`,
+        Mount: entity.mount_height_m == null ? '—' : `${Number(entity.mount_height_m).toFixed(3)} m`,
+      };
+    }
+    if (kind === 'dimension') {
+      return {
+        ID: entity.dimension_id,
+        Length: `${Number(entity.length_m).toFixed(3)} m`,
+        Angle: `${Number(entity.angle_deg).toFixed(2)}°`,
+        Label: entity.label || '—',
+      };
+    }
+    if (kind === 'zone') {
+      return {
+        ID: entity.zone_id,
+        Name: entity.name,
+        Bounds: `${Number(entity.x_min).toFixed(2)}, ${Number(entity.y_min).toFixed(2)} → ${Number(entity.x_max).toFixed(2)}, ${Number(entity.y_max).toFixed(2)} m`,
+      };
+    }
+    return {
+      ID: entity.object_id,
+      Type: entity.object_type,
+      Label: entity.label || '—',
+      Geometry: JSON.stringify(entity.geometry),
+    };
+  }
+
+  function updateInspector() {
+    const entity = entityBySelection();
+    ui.selectionSummary.textContent = entity
+      ? `${state.selected.kind[0].toUpperCase()}${state.selected.kind.slice(1)}`
+      : 'ยังไม่ได้เลือกวัตถุ';
+    ui.selectionDetails.replaceChildren();
+    for (const [label, value] of Object.entries(describeSelection(entity))) {
+      const row = document.createElement('div');
+      const term = document.createElement('dt');
+      const detail = document.createElement('dd');
+      term.textContent = label;
+      detail.textContent = String(value);
+      row.append(term, detail);
+      ui.selectionDetails.appendChild(row);
+    }
+    const values = [state.objects.length, state.zones.length, state.anchors.length, state.dimensions.length];
+    ui.counts.querySelectorAll('b').forEach((element, index) => {
+      element.textContent = String(values[index] || 0);
+    });
+  }
+
+  function selectEntity(kind, id) {
+    state.selected = kind ? { kind, id } : null;
+    renderScene();
+  }
+
+  function setTool(tool) {
+    if (EDIT_TOOLS.has(tool) && !state.canEdit) {
+      setMessage('โหมดวาดต้องใช้สิทธิ์ admin', 'error');
+      return;
+    }
+    state.tool = tool;
+    state.draft = tool === 'zone' ? { kind: 'zone', points: [], cursor: null } : null;
+    document.querySelectorAll('[data-tool]').forEach(button => {
+      const active = button.dataset.tool === tool;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    ui.svg.dataset.tool = tool;
+    const help = {
+      select: 'Select: คลิกวัตถุเพื่อเลือก · ลาก object เพื่อย้าย',
+      line: 'Line: ลากจากจุดเริ่มไปจุดปลาย',
+      rectangle: 'Rectangle: ลากมุมตรงข้ามสองมุม',
+      zone: 'Zone: คลิกอย่างน้อย 3 จุด แล้วคลิกจุดแรกหรือกด Enter',
+      anchor: 'Anchor: คลิกตำแหน่งติดตั้ง',
+      dimension: 'Dimension: ลากระหว่างสองจุด',
+    };
+    setMessage(help[tool] || '');
+    renderDraft();
+  }
+
+  async function safeMutation(action, successMessage) {
+    if (state.busy) return null;
+    state.busy = true;
+    try {
+      const result = await action();
+      if (successMessage) setMessage(successMessage, 'ok');
+      return result;
+    } catch (error) {
+      setMessage(error?.message || 'บันทึกข้อมูลไม่สำเร็จ', 'error');
+      return null;
+    } finally {
+      state.busy = false;
+    }
+  }
+
+  async function createObject(kind, start, end) {
+    let geometry;
+    if (kind === 'rectangle') {
+      geometry = {
+        type: 'rectangle',
+        x: Math.min(start.x, end.x),
+        y: Math.min(start.y, end.y),
+        width: Math.abs(end.x - start.x),
+        height: Math.abs(end.y - start.y),
+      };
+    } else {
+      geometry = geometryFromPoints('line', [start, end]);
+    }
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/objects`, {
+        method: 'POST',
+        body: JSON.stringify({ object_type: kind, geometry, properties: {} }),
+      }),
+      `${kind} บันทึกแล้ว`,
+    );
+    if (response?.object) {
+      state.objects.push(response.object);
+      selectEntity('object', response.object.object_id);
+    }
+  }
+
+  async function createZone(points) {
+    const name = `Zone ${state.zones.length + 1}`;
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/zones`, {
+        method: 'POST',
+        body: JSON.stringify({ name, geometry: geometryFromPoints('polygon', points) }),
+      }),
+      `${name} บันทึกแล้ว`,
+    );
+    if (response?.zone) {
+      state.zones.push(response.zone);
+      selectEntity('zone', response.zone.zone_id);
+    }
+  }
+
+  function nextAnchorId() {
+    const numbers = state.anchors
+      .map(anchor => /^A(\d+)$/i.exec(String(anchor.anchor_id)))
+      .filter(Boolean)
+      .map(match => Number(match[1]));
+    const number = Math.max(0, ...numbers) + 1;
+    return `A${String(number).padStart(2, '0')}`;
+  }
+
+  async function createAnchor(point) {
+    const anchorId = nextAnchorId();
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/anchors`, {
+        method: 'POST',
+        body: JSON.stringify({ anchor_id: anchorId, x: point.x, y: point.y }),
+      }),
+      `${anchorId} บันทึกแล้ว`,
+    );
+    if (response?.anchor) {
+      state.anchors.push(response.anchor);
+      selectEntity('anchor', response.anchor.anchor_id);
+    }
+  }
+
+  async function createDimension(start, end) {
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/dimensions`, {
+        method: 'POST',
+        body: JSON.stringify({ x1: start.x, y1: start.y, x2: end.x, y2: end.y }),
+      }),
+      'Dimension บันทึกแล้ว',
+    );
+    if (response?.dimension) {
+      state.dimensions.push(response.dimension);
+      selectEntity('dimension', response.dimension.dimension_id);
+    }
+  }
+
+  function translatedGeometry(geometry, dx, dy) {
+    const translated = JSON.parse(JSON.stringify(geometry || {}));
+    if (Array.isArray(translated.points)) {
+      translated.points = translated.points.map(point => [Number(point[0]) + dx, Number(point[1]) + dy]);
+    }
+    if (Number.isFinite(Number(translated.x))) translated.x = Number(translated.x) + dx;
+    if (Number.isFinite(Number(translated.y))) translated.y = Number(translated.y) + dy;
+    if (Array.isArray(translated.origin) && translated.origin.length >= 2) {
+      translated.origin = [Number(translated.origin[0]) + dx, Number(translated.origin[1]) + dy];
+    }
+    return translated;
+  }
+
+  async function saveObjectDrag(drag) {
+    const object = state.objects.find(item => String(item.object_id) === String(drag.id));
+    if (!object) return;
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/objects/${encodeURIComponent(drag.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ geometry: object.geometry }),
+      }),
+      'ย้าย object แล้ว',
+    );
+    if (response?.object) {
+      Object.assign(object, response.object);
+    } else {
+      object.geometry = drag.originalGeometry;
+    }
+    renderScene();
+  }
+
+  async function deleteSelection() {
+    if (!state.canEdit) return setMessage('Delete ต้องใช้สิทธิ์ admin', 'error');
+    if (!state.selected) return setMessage('เลือก object ที่ต้องการลบก่อน', 'error');
+    if (state.selected.kind !== 'object') {
+      return setMessage('Phase นี้รองรับ Delete สำหรับ plan object เท่านั้น', 'error');
+    }
+    const id = state.selected.id;
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/objects/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
+      'ลบ object แล้ว',
+    );
+    if (response?.ok) {
+      state.objects = state.objects.filter(object => String(object.object_id) !== String(id));
+      state.selected = null;
+      renderScene();
+    }
+  }
+
+  function distance(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  function finishZone() {
+    if (state.tool !== 'zone' || !state.draft || state.draft.points.length < 3) {
+      setMessage('Zone ต้องมีอย่างน้อย 3 จุด', 'error');
+      return;
+    }
+    const points = state.draft.points.slice();
+    state.draft = { kind: 'zone', points: [], cursor: null };
+    renderDraft();
+    void createZone(points);
+  }
+
+  function cancelInteraction() {
+    if (state.drag) {
+      const object = state.objects.find(item => String(item.object_id) === String(state.drag.id));
+      if (object) object.geometry = state.drag.originalGeometry;
+      state.drag = null;
+    }
+    state.pan = null;
+    ui.svg.classList.remove('is-panning');
+    state.draft = state.tool === 'zone' ? { kind: 'zone', points: [], cursor: null } : null;
+    renderScene();
+    setMessage('ยกเลิกแล้ว');
+  }
+
+  function beginPan(event) {
+    state.pan = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      view: { ...state.view },
+    };
+    ui.svg.classList.add('is-panning');
+    ui.svg.setPointerCapture(event.pointerId);
+  }
+
+  function onPointerDown(event) {
+    if (!state.plan) return;
+    ui.svg.focus({ preventScroll: true });
+    if (event.button === 1 || (event.button === 0 && state.spaceDown)) {
+      event.preventDefault();
+      beginPan(event);
+      return;
+    }
+    if (event.button !== 0) return;
+
+    const point = pointerMetres(event, true);
+    if (state.tool === 'select') {
+      const target = event.target.closest?.('[data-kind]');
+      if (!target) {
+        selectEntity(null, null);
+        return;
+      }
+      const kind = target.dataset.kind;
+      const id = target.dataset.id;
+      selectEntity(kind, id);
+      if (kind === 'object' && state.canEdit) {
+        const object = entityBySelection();
+        state.drag = {
+          id,
+          start: point,
+          originalGeometry: JSON.parse(JSON.stringify(object.geometry)),
+        };
+        ui.svg.setPointerCapture(event.pointerId);
+      }
+      return;
+    }
+
+    if (!state.canEdit) return;
+    if (state.tool === 'anchor') {
+      void createAnchor(point);
+      return;
+    }
+    if (state.tool === 'zone') {
+      const points = state.draft?.points || [];
+      const closeTolerance = metresPerPixel() * 12;
+      if (points.length >= 3 && distance(point, points[0]) <= closeTolerance) {
+        finishZone();
+      } else {
+        points.push(point);
+        state.draft = { kind: 'zone', points, cursor: point };
+        renderDraft();
+      }
+      return;
+    }
+    if (state.tool === 'line' || state.tool === 'rectangle' || state.tool === 'dimension') {
+      state.draft = { kind: state.tool, start: point, end: point };
+      ui.svg.setPointerCapture(event.pointerId);
+      renderDraft();
+    }
+  }
+
+  function onPointerMove(event) {
+    if (!state.plan) return;
+    const raw = pointerMetres(event, false);
+    const snapped = snapPoint(raw);
+    ui.cursor.textContent = `X ${snapped.x.toFixed(2)} · Y ${snapped.y.toFixed(2)} m`;
+
+    if (state.pan) {
+      const rect = canvasRect();
+      const dx = ((event.clientX - state.pan.clientX) / Math.max(1, rect.width)) * state.pan.view.width;
+      const dy = ((event.clientY - state.pan.clientY) / Math.max(1, rect.height)) * state.pan.view.height;
+      state.view.x = state.pan.view.x - dx;
+      state.view.y = state.pan.view.y - dy;
+      applyViewBox(false);
+      return;
+    }
+
+    if (state.drag) {
+      const object = state.objects.find(item => String(item.object_id) === String(state.drag.id));
+      if (!object) return;
+      const dx = snapped.x - state.drag.start.x;
+      const dy = snapped.y - state.drag.start.y;
+      object.geometry = translatedGeometry(state.drag.originalGeometry, dx, dy);
+      renderScene();
+      return;
+    }
+
+    if (state.draft?.kind === 'zone') {
+      state.draft.cursor = snapped;
+      renderDraft();
+    } else if (state.draft?.start) {
+      state.draft.end = snapped;
+      renderDraft();
+    }
+  }
+
+  function onPointerUp(event) {
+    if (state.pan) {
+      state.pan = null;
+      ui.svg.classList.remove('is-panning');
+      return;
+    }
+    if (state.drag) {
+      const drag = state.drag;
+      state.drag = null;
+      void saveObjectDrag(drag);
+      return;
+    }
+    const draft = state.draft;
+    if (!draft?.start || !draft.end) return;
+    state.draft = null;
+    renderDraft();
+    if (distance(draft.start, draft.end) < state.gridStep * 0.05) {
+      setMessage('ระยะสั้นเกินไป จึงยังไม่ได้สร้างวัตถุ', 'error');
+      return;
+    }
+    if (draft.kind === 'dimension') void createDimension(draft.start, draft.end);
+    else void createObject(draft.kind, draft.start, draft.end);
+    try { ui.svg.releasePointerCapture(event.pointerId); } catch (_error) { /* already released */ }
+  }
+
+  function wireEditorEvents() {
+    document.querySelectorAll('[data-tool]').forEach(button => {
+      button.addEventListener('click', () => setTool(button.dataset.tool));
+    });
+    document.getElementById('tool-delete').addEventListener('click', () => void deleteSelection());
+    document.getElementById('tool-grid').addEventListener('click', event => {
+      state.gridVisible = !state.gridVisible;
+      event.currentTarget.classList.toggle('is-active', state.gridVisible);
+      event.currentTarget.setAttribute('aria-pressed', String(state.gridVisible));
+      updateGrid();
+    });
+    document.getElementById('tool-snap').addEventListener('click', event => {
+      state.snapEnabled = !state.snapEnabled;
+      event.currentTarget.classList.toggle('is-active', state.snapEnabled);
+      event.currentTarget.setAttribute('aria-pressed', String(state.snapEnabled));
+      setMessage(`Snap ${state.snapEnabled ? 'เปิด' : 'ปิด'}`);
+    });
+    document.getElementById('tool-fit').addEventListener('click', fitView);
+    document.getElementById('tool-zoom-in').addEventListener('click', () => zoomAt(0.8));
+    document.getElementById('tool-zoom-out').addEventListener('click', () => zoomAt(1.25));
+    ui.gridSize.addEventListener('change', () => {
+      const value = Number(ui.gridSize.value);
+      if (!Number.isFinite(value) || value <= 0) {
+        ui.gridSize.value = String(state.gridStep);
+        return setMessage('Grid spacing ต้องมากกว่า 0 เมตร', 'error');
+      }
+      state.gridStep = value;
+      updateGrid();
+      setMessage(`Grid / Snap ${value} m`);
+    });
+
+    ui.svg.addEventListener('pointerdown', onPointerDown);
+    ui.svg.addEventListener('pointermove', onPointerMove);
+    ui.svg.addEventListener('pointerup', onPointerUp);
+    ui.svg.addEventListener('pointercancel', cancelInteraction);
+    ui.svg.addEventListener('contextmenu', event => event.preventDefault());
+    ui.svg.addEventListener('wheel', event => {
+      event.preventDefault();
+      zoomAt(event.deltaY < 0 ? 0.88 : 1.14, event.clientX, event.clientY);
+    }, { passive: false });
+
+    document.addEventListener('keydown', event => {
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName);
+      if (event.code === 'Space' && !typing) {
+        state.spaceDown = true;
+        event.preventDefault();
+      }
+      if (event.key === 'Escape') cancelInteraction();
+      if (event.key === 'Enter' && state.tool === 'zone' && !typing) finishZone();
+      if ((event.key === 'Delete' || event.key === 'Backspace') && !typing) {
+        event.preventDefault();
+        void deleteSelection();
+      }
+    });
+    document.addEventListener('keyup', event => {
+      if (event.code === 'Space') state.spaceDown = false;
+    });
+
+    ui.loadPlan.addEventListener('click', () => void loadPlan(ui.planInput.value.trim()));
+    ui.planInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') void loadPlan(ui.planInput.value.trim());
+    });
+    ui.logout.addEventListener('click', async () => {
+      try { await api('/api/signout', { method: 'POST' }); } catch (_error) { /* leave anyway */ }
+      localStorage.removeItem('tw_token');
+      session.token = null;
+      window.location.href = 'login.html';
+    });
+
+    if ('ResizeObserver' in window) {
+      const observer = new ResizeObserver(() => adjustViewToCanvas());
+      observer.observe(ui.canvasWrap);
+    } else {
+      window.addEventListener('resize', adjustViewToCanvas);
+    }
+  }
+
+  function updateUser(user) {
+    const fullName = `${user.first_th || user.first_en || ''} ${user.last_th || user.last_en || ''}`.trim();
+    ui.userName.textContent = fullName || user.email || user.employee_id;
+    ui.userMeta.textContent = `${user.employee_id} · ${user.position || user.role}`;
+    ui.avatar.textContent = `${(user.first_en || '?')[0]}${(user.last_en || '')[0] || ''}`.toUpperCase();
+    state.canEdit = user.role === 'admin';
+    ui.roleHint.textContent = state.canEdit
+      ? 'Admin · สามารถวาด แก้ไข และลบ plan objects ได้'
+      : `Read only · role ${user.role} ไม่มีสิทธิ์แก้ไขแปลน`;
+    ui.roleHint.classList.toggle('can-edit', state.canEdit);
+    document.querySelectorAll('[data-tool]').forEach(button => {
+      if (EDIT_TOOLS.has(button.dataset.tool)) button.disabled = !state.canEdit;
+    });
+    document.getElementById('tool-delete').disabled = !state.canEdit;
+  }
+
+  async function fallbackPlanId() {
+    const bootstrap = await api('/api/bootstrap');
+    const projects = bootstrap.projects || [];
+    return projects.map(project => project.plan_id).find(Boolean) || '';
+  }
+
+  async function loadPlan(planId) {
+    if (!planId) {
+      showLoading('ไม่พบ plan_id กรุณาระบุ Plan ID', true);
+      return;
+    }
+    showLoading(`กำลังโหลด ${planId}...`);
+    state.selected = null;
+    state.draft = null;
+    try {
+      const encoded = encodeURIComponent(planId);
+      const [planResult, objectResult, zoneResult, anchorResult, dimensionResult] = await Promise.all([
+        api(`/api/plans/${encoded}`),
+        api(`/api/plans/${encoded}/objects`),
+        api(`/api/plans/${encoded}/zones`),
+        api(`/api/plans/${encoded}/anchors`),
+        api(`/api/plans/${encoded}/dimensions`),
+      ]);
+      state.plan = planResult.plan;
+      state.objects = objectResult.objects || [];
+      state.zones = zoneResult.zones || [];
+      state.anchors = anchorResult.anchors || [];
+      state.dimensions = dimensionResult.dimensions || [];
+      ui.planInput.value = state.plan.plan_id;
+      ui.planTitle.textContent = state.plan.name;
+      ui.planMeta.textContent = `${state.plan.plan_id} · ${Number(state.plan.width_m).toFixed(2)} × ${Number(state.plan.height_m).toFixed(2)} m · Version ${state.plan.version}`;
+      document.title = `${state.plan.name} | Plan Editor`;
+      const url = new URL(window.location.href);
+      url.searchParams.set('plan_id', state.plan.plan_id);
+      history.replaceState(null, '', url);
+      hideLoading();
+      fitView();
+      setTool('select');
+    } catch (error) {
+      showLoading(`โหลดแปลนไม่สำเร็จ: ${error?.message || error}`, true);
+      setMessage('ตรวจสอบ Plan ID และการเชื่อมต่อ backend', 'error');
+    }
+  }
+
+  async function initialise() {
+    wireEditorEvents();
+    if (!session.token) {
+      window.location.replace('login.html');
+      return;
+    }
+    try {
+      const me = await api('/api/me');
+      session.user = me.user;
+      updateUser(me.user);
+    } catch (_error) {
+      localStorage.removeItem('tw_token');
+      window.location.replace('login.html');
+      return;
+    }
+
+    let planId = new URLSearchParams(window.location.search).get('plan_id') || '';
+    if (!planId) {
+      try { planId = await fallbackPlanId(); }
+      catch (error) {
+        showLoading(`โหลดรายการแปลนไม่สำเร็จ: ${error?.message || error}`, true);
+        return;
+      }
+    }
+    await loadPlan(planId);
+  }
+
+  void initialise().catch(error => {
+    showLoading(`เปิด Plan Editor ไม่สำเร็จ: ${error?.message || error}`, true);
+  });
+})();
