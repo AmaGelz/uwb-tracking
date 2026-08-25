@@ -9,6 +9,7 @@ const db: any = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 const ALLOWED_ORIGINS = new Set([
   "https://amagelz.github.io",
+  "https://jitmnaljkughkhmxeaov.supabase.co",
   "http://127.0.0.1:8765",
   "http://localhost:8765",
 ]);

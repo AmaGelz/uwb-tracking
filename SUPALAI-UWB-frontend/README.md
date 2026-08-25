@@ -16,17 +16,14 @@ Production endpoints keep the existing `/api/...` contract through the
 Supabase Edge Function in `../supabase/functions/api`. The FastAPI backend is
 retained for local/legacy deployments.
 
-## GitHub Pages deployment
+## Supabase deployment
 
-GitHub Pages hosts the static frontend. Supabase provides Auth, Postgres,
-Realtime and the Edge Function API.
+Supabase provides Auth, Postgres, Realtime, the Edge Function API and the
+public static site.
 
-1. Deploy Supabase migrations and function as described in `../supabase/README.md`.
-2. In **Settings → Pages**, select **GitHub Actions** as the source.
-3. Push to `main`, or run **Deploy frontend to GitHub Pages** manually.
-
-The workflow publishes `SUPALAI-UWB-frontend` as the site root. The expected
-URL is `https://amagelz.github.io/uwb-tracking/`.
+Deploy Supabase migrations, functions and Storage objects as described in
+`../supabase/README.md`. The production URL is
+`https://jitmnaljkughkhmxeaov.supabase.co/functions/v1/site/index.html`.
 
 If Google Sign-In is enabled, configure the Google provider in Supabase Auth
-and allow `https://amagelz.github.io/uwb-tracking/` as a redirect URL.
+and allow the production `site` Edge Function URL as a redirect URL.
