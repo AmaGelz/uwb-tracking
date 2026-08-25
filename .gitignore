@@ -18,3 +18,6 @@ backend/.env
 .vscode/
 .idea/
 .DS_Store
+
+# Supabase CLI local link/cache (may contain connection metadata)
+supabase/.temp/

@@ -1,108 +1,136 @@
-/* SUPALAI-UWB authentication — same original Sign In / Google flow. */
+/* SUPALAI-UWB authentication through Supabase Auth. */
 'use strict';
 
-const q = (sel, root = document) => root.querySelector(sel);
-const escAuth = s => String(s ?? '').replace(/[&<>"']/g,
-  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const { api, state: S, OfflineError } = window.SUPALAI_API;
+(() => {
+  const initialAuthFlow = new URLSearchParams(window.location.hash.slice(1)).get('type')
+    || new URLSearchParams(window.location.search).get('type');
+  const isPasswordSetupFlow = initialAuthFlow === 'invite' || initialAuthFlow === 'recovery';
+  const q = (sel, root = document) => root.querySelector(sel);
+  const escAuth = value => String(value ?? '').replace(/[&<>"']/g,
+    char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+  const {
+    api,
+    ensureSession,
+    supabase: supabaseClient,
+    state: sessionState,
+    OfflineError,
+  } = window.SUPALAI_API;
 
-function saveSession(r) {
-  S.token = r.token;
-  S.user = r.user;
-  localStorage.setItem('tw_token', r.token);
-}
-
-function goDashboard() {
-  window.location.href = 'dashboard.html#/overview';
-}
-
-async function handleGoogleLogin(response) {
-  const err = q('#signin-err');
-  const googleHost = q('#google-btn');
-  if (!response || !response.credential) {
-    err.innerHTML = '<div class="err">ไม่ได้รับข้อมูลจาก Google</div>';
-    return;
+  function goDashboard() {
+    window.location.href = 'dashboard.html#/overview';
   }
-  if (googleHost) googleHost.style.opacity = '0.65';
-  err.innerHTML = '';
-  try {
-    const r = await api('/api/google-signin', {
-      method: 'POST',
-      body: JSON.stringify({ credential: response.credential }),
-    });
-    if (!r.ok) {
-      err.innerHTML = `<div class="err">${escAuth(r.error)}</div>`;
-      return;
-    }
-    saveSession(r);
+
+  async function finishSignIn(session) {
+    sessionState.token = session.access_token;
+    localStorage.setItem('tw_token', session.access_token);
+    const me = await api('/api/me');
+    sessionState.user = me.user;
     goDashboard();
-  } catch (e) {
-    err.innerHTML = e instanceof OfflineError
-      ? '<div class="err">ติดต่อ server ไม่ได้ — ตรวจว่า backend API ยังรันอยู่</div>'
-      : `<div class="err">${escAuth(e.message)}</div>`;
-  } finally {
-    if (googleHost) googleHost.style.opacity = '';
   }
-}
 
-async function setupGoogle() {
-  window.handleGoogleLogin = handleGoogleLogin;
-  const host = q('#google-btn');
-  try {
-    const cfg = await api('/api/auth/google-config');
-    if (cfg.enabled && window.google && window.google.accounts && window.google.accounts.id) {
-      window.google.accounts.id.initialize({
-        client_id: cfg.client_id,
-        callback: handleGoogleLogin,
-        auto_select: false,
-        cancel_on_tap_outside: true,
-      });
-      window.google.accounts.id.renderButton(host, {
-        type: 'standard', theme: 'outline', size: 'large',
-        text: 'continue_with', shape: 'rectangular', width: 344,
-      });
-    } else if (!cfg.enabled) {
-      host.innerHTML = '<div class="google-disabled">Google Sign-In ยังไม่ได้ตั้งค่า</div>';
-    } else {
-      host.innerHTML = '<div class="google-disabled">โหลด Google Sign-In ไม่สำเร็จ</div>';
-    }
-  } catch (e) {
-    host.innerHTML = '<div class="google-disabled">Google Sign-In ใช้งานไม่ได้</div>';
+  function showError(error) {
+    const host = q('#signin-err');
+    const message = error instanceof OfflineError
+      ? 'ติดต่อ Supabase server ไม่ได้'
+      : error?.message || error || 'เข้าสู่ระบบไม่สำเร็จ';
+    host.innerHTML = `<div class="err">${escAuth(message)}</div>`;
   }
-}
 
-function setupPasswordLogin() {
-  const form = q('#signin-form');
-  if (!form) return;
-  form.onsubmit = async ev => {
-    ev.preventDefault();
-    const btn = q('button[type=submit]', form);
-    const err = q('#signin-err');
-    btn.disabled = true;
-    err.innerHTML = '';
-    try {
-      const r = await api('/api/signin', {
-        method: 'POST',
-        body: JSON.stringify({ email: q('#si-email').value, password: q('#si-pw').value }),
-      });
-      if (!r.ok) {
-        err.innerHTML = `<div class="err">${escAuth(r.error)}</div>`;
-        return;
+  function setupPasswordLogin() {
+    const form = q('#signin-form');
+    if (!form) return;
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const button = q('button[type=submit]', form);
+      button.disabled = true;
+      q('#signin-err').innerHTML = '';
+      try {
+        if (!supabaseClient) throw new Error('ยังไม่ได้ตั้งค่า Supabase client');
+        const { data, error } = await supabaseClient.auth.signInWithPassword({
+          email: q('#si-email').value.trim(),
+          password: q('#si-pw').value,
+        });
+        if (error) throw error;
+        if (!data.session) throw new Error('Supabase ไม่ส่ง session กลับมา');
+        await finishSignIn(data.session);
+      } catch (error) {
+        showError(error);
+      } finally {
+        button.disabled = false;
       }
-      saveSession(r);
-      goDashboard();
-    } catch (e) {
-      err.innerHTML = e instanceof OfflineError
-        ? '<div class="err">ติดต่อ server ไม่ได้ — ตรวจว่า backend API ยังรันอยู่ แล้วลองใหม่</div>'
-        : `<div class="err">${escAuth(e.message)}</div>`;
-    } finally {
-      btn.disabled = false;
-    }
-  };
-}
+    };
+  }
 
-document.addEventListener('DOMContentLoaded', () => {
-  document.body.className = 'signin-page';
-  setupPasswordLogin();
-  setupGoogle();
-});
+  function setupInvitedPassword() {
+    const form = q('#signin-form');
+    const emailField = q('#si-email')?.closest('.field');
+    if (emailField) emailField.hidden = true;
+    q('.signin h2').textContent = 'Set your password';
+    const password = q('#si-pw');
+    password.autocomplete = 'new-password';
+    password.minLength = 8;
+    password.placeholder = 'อย่างน้อย 8 ตัวอักษร';
+    q('label[for="si-pw"]').textContent = 'New password';
+    const submit = q('button[type=submit]', form);
+    submit.textContent = 'Save password';
+    q('.signin-divider').hidden = true;
+    q('#google-btn').hidden = true;
+    q('.signin-hint').textContent = 'ตั้งรหัสผ่านสำหรับบัญชี Supabase Auth ที่ได้รับเชิญ';
+
+    form.onsubmit = async event => {
+      event.preventDefault();
+      submit.disabled = true;
+      q('#signin-err').innerHTML = '';
+      try {
+        const session = await ensureSession();
+        if (!session) throw new Error('Invite link หมดอายุ กรุณาขอคำเชิญใหม่');
+        const { error } = await supabaseClient.auth.updateUser({ password: password.value });
+        if (error) throw error;
+        await finishSignIn(session);
+      } catch (error) {
+        showError(error);
+      } finally {
+        submit.disabled = false;
+      }
+    };
+  }
+
+  function setupGoogleLogin() {
+    const host = q('#google-btn');
+    if (!host) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-block google-auth-button';
+    button.textContent = 'Continue with Google';
+    button.onclick = async () => {
+      button.disabled = true;
+      q('#signin-err').innerHTML = '';
+      try {
+        if (!supabaseClient) throw new Error('ยังไม่ได้ตั้งค่า Supabase client');
+        const redirectTo = new URL('dashboard.html#/overview', window.location.href).toString();
+        const { error } = await supabaseClient.auth.signInWithOAuth({
+          provider: 'google',
+          options: { redirectTo },
+        });
+        if (error) throw error;
+      } catch (error) {
+        showError(error);
+        button.disabled = false;
+      }
+    };
+    host.replaceChildren(button);
+  }
+
+  document.addEventListener('DOMContentLoaded', async () => {
+    document.body.className = 'signin-page';
+    if (isPasswordSetupFlow) setupInvitedPassword();
+    else {
+      setupPasswordLogin();
+      setupGoogleLogin();
+    }
+    try {
+      const session = await ensureSession();
+      if (session && !isPasswordSetupFlow) goDashboard();
+    } catch (_error) { /* stay on the sign-in page */ }
+  });
+})();

@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sign In | SUPALAI</title>
   <link rel="stylesheet" href="css/style.css">
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body class="signin-page">
   <form class="signin" id="signin-form">
@@ -25,11 +24,10 @@
     <button class="btn btn-primary btn-block" type="submit">Next</button>
     <div class="signin-divider"><span>OR</span></div>
     <div class="google-wrap" id="google-btn"></div>
-    <div class="signin-hint">
-      บัญชีตัวอย่าง (รหัสผ่านทั้งหมด: 1234)<br>
-      admin@supalai.com · lead@supalai.com · mandee.jai@supalai.com
-    </div>
+    <div class="signin-hint">เข้าสู่ระบบด้วยบัญชีที่ผู้ดูแลเชิญผ่าน Supabase Auth</div>
   </form>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="js/runtime-config.js"></script>
   <script src="js/api.js"></script>
   <script src="js/auth.js"></script>
 </body>
