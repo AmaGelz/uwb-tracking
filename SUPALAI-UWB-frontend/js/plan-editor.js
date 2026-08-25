@@ -38,6 +38,16 @@
     loadPlan: document.getElementById('load-plan'),
     selectionSummary: document.getElementById('selection-summary'),
     selectionDetails: document.getElementById('selection-details'),
+    anchorSettings: document.getElementById('anchor-settings'),
+    anchorSettingsTitle: document.getElementById('anchor-settings-title'),
+    anchorIdInput: document.getElementById('anchor-id-input'),
+    anchorZInput: document.getElementById('anchor-z-input'),
+    anchorMountInput: document.getElementById('anchor-mount-input'),
+    saveAnchorProperties: document.getElementById('save-anchor-properties'),
+    lineSettings: document.getElementById('line-settings'),
+    lineLengthInput: document.getElementById('line-length-input'),
+    lineAngleInput: document.getElementById('line-angle-input'),
+    saveLineProperties: document.getElementById('save-line-properties'),
     counts: document.getElementById('entity-counts'),
     gridSize: document.getElementById('grid-size'),
     roleHint: document.getElementById('editor-role-hint'),
@@ -64,6 +74,7 @@
     gridStep: 1,
     canEdit: false,
     busy: false,
+    zoneNameOpen: false,
     view: { x: -1, y: -1, width: 22, height: 22 },
     fitWidth: 22,
   };
@@ -149,6 +160,22 @@
 
   function geometryFromPoints(type, points) {
     return { type, points: points.map(point => [point.x, point.y]) };
+  }
+
+  function measurement(start, end) {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    return {
+      length: Math.hypot(dx, dy),
+      angle: Math.atan2(dy, dx) * 180 / Math.PI,
+    };
+  }
+
+  function linePoints(object) {
+    if (!object) return [];
+    const type = String(object.geometry?.type || object.object_type || '').toLowerCase();
+    const points = pointsFromGeometry(object.geometry);
+    return type === 'line' && points.length >= 2 ? points.slice(0, 2) : [];
   }
 
   function entityGroup(kind, id) {
@@ -271,6 +298,46 @@
     ];
   }
 
+  function pointOnSegment(point, start, end, epsilon = 1e-9) {
+    const cross = (point.y - start.y) * (end.x - start.x)
+      - (point.x - start.x) * (end.y - start.y);
+    if (Math.abs(cross) > epsilon) return false;
+    return point.x >= Math.min(start.x, end.x) - epsilon
+      && point.x <= Math.max(start.x, end.x) + epsilon
+      && point.y >= Math.min(start.y, end.y) - epsilon
+      && point.y <= Math.max(start.y, end.y) + epsilon;
+  }
+
+  // Ray-casting in world metres. Points on a polygon edge count as inside so
+  // a tag exactly on a room boundary does not flicker between zone and null.
+  function pointInPolygon(point, polygon) {
+    const candidate = Array.isArray(polygon)
+      ? polygon.map(value => Array.isArray(value)
+        ? { x: Number(value[0]), y: Number(value[1]) }
+        : { x: Number(value.x), y: Number(value.y) })
+      : pointsFromGeometry(polygon?.geometry || polygon);
+    const points = candidate.length >= 3 ? candidate : zonePoints(polygon || {});
+    if (points.length < 3 || !Number.isFinite(Number(point?.x)) || !Number.isFinite(Number(point?.y))) {
+      return false;
+    }
+
+    const target = { x: Number(point.x), y: Number(point.y) };
+    let inside = false;
+    for (let index = 0, previous = points.length - 1; index < points.length; previous = index++) {
+      const a = points[previous];
+      const b = points[index];
+      if (pointOnSegment(target, a, b)) return true;
+      const crosses = (a.y > target.y) !== (b.y > target.y)
+        && target.x < ((b.x - a.x) * (target.y - a.y)) / (b.y - a.y) + a.x;
+      if (crosses) inside = !inside;
+    }
+    return inside;
+  }
+
+  function zoneAtPoint(point, zones = state.zones) {
+    return zones.find(zone => pointInPolygon(point, zone)) || null;
+  }
+
   function renderZones() {
     clearLayer(ui.zoneLayer);
     const scale = visualScale();
@@ -380,6 +447,16 @@
         x2: draft.end.x,
         y2: svgY(draft.end.y),
       }));
+      if (draft.kind === 'dimension') {
+        const { length } = measurement(draft.start, draft.end);
+        addLabel(
+          ui.draftLayer,
+          `${length.toFixed(2)} m`,
+          (draft.start.x + draft.end.x) / 2,
+          svgY((draft.start.y + draft.end.y) / 2) - scale.offset,
+          'middle',
+        );
+      }
     }
   }
 
@@ -507,10 +584,25 @@
       };
     }
     if (kind === 'zone') {
+      const points = zonePoints(entity);
       return {
         ID: entity.zone_id,
         Name: entity.name,
+        Points: points.length,
         Bounds: `${Number(entity.x_min).toFixed(2)}, ${Number(entity.y_min).toFixed(2)} → ${Number(entity.x_max).toFixed(2)}, ${Number(entity.y_max).toFixed(2)} m`,
+        Geometry: JSON.stringify(entity.geometry),
+      };
+    }
+    const points = linePoints(entity);
+    if (points.length === 2) {
+      const { length, angle } = measurement(points[0], points[1]);
+      return {
+        ID: entity.object_id,
+        Type: entity.object_type,
+        Length: `${length.toFixed(3)} m`,
+        Angle: `${angle.toFixed(2)}°`,
+        Start: `${points[0].x.toFixed(3)}, ${points[0].y.toFixed(3)} m`,
+        End: `${points[1].x.toFixed(3)}, ${points[1].y.toFixed(3)} m`,
       };
     }
     return {
@@ -540,6 +632,42 @@
     ui.counts.querySelectorAll('b').forEach((element, index) => {
       element.textContent = String(values[index] || 0);
     });
+    updateAnchorSettings(entity);
+    updateLineSettings(entity);
+  }
+
+  function updateAnchorSettings(entity) {
+    const selectedAnchor = state.selected?.kind === 'anchor' ? entity : null;
+    const placingAnchor = state.tool === 'anchor' && !selectedAnchor;
+    ui.anchorSettings.hidden = !selectedAnchor && !placingAnchor;
+    if (ui.anchorSettings.hidden) return;
+
+    ui.anchorSettingsTitle.textContent = selectedAnchor ? 'Anchor properties' : 'Anchor placement defaults';
+    ui.anchorIdInput.disabled = Boolean(selectedAnchor);
+    ui.anchorIdInput.placeholder = `Auto: ${nextAnchorId()}`;
+    ui.saveAnchorProperties.hidden = !selectedAnchor || !state.canEdit;
+
+    if (!ui.anchorSettings.contains(document.activeElement)) {
+      ui.anchorIdInput.value = selectedAnchor?.anchor_id || '';
+      ui.anchorZInput.value = selectedAnchor?.z == null ? '' : String(selectedAnchor.z);
+      ui.anchorMountInput.value = selectedAnchor?.mount_height_m == null
+        ? '' : String(selectedAnchor.mount_height_m);
+    }
+  }
+
+  function updateLineSettings(entity) {
+    const points = state.selected?.kind === 'object' ? linePoints(entity) : [];
+    ui.lineSettings.hidden = points.length !== 2;
+    if (ui.lineSettings.hidden) return;
+
+    const { length, angle } = measurement(points[0], points[1]);
+    ui.lineLengthInput.disabled = !state.canEdit;
+    ui.lineAngleInput.disabled = !state.canEdit;
+    ui.saveLineProperties.hidden = !state.canEdit;
+    if (!ui.lineSettings.contains(document.activeElement)) {
+      ui.lineLengthInput.value = length.toFixed(6).replace(/\.?0+$/, '');
+      ui.lineAngleInput.value = angle.toFixed(6).replace(/\.?0+$/, '');
+    }
   }
 
   function selectEntity(kind, id) {
@@ -553,6 +681,7 @@
       return;
     }
     state.tool = tool;
+    if (tool === 'anchor') state.selected = null;
     state.draft = tool === 'zone' ? { kind: 'zone', points: [], cursor: null } : null;
     document.querySelectorAll('[data-tool]').forEach(button => {
       const active = button.dataset.tool === tool;
@@ -564,12 +693,12 @@
       select: 'Select: คลิกวัตถุเพื่อเลือก · ลาก object เพื่อย้าย',
       line: 'Line: ลากจากจุดเริ่มไปจุดปลาย',
       rectangle: 'Rectangle: ลากมุมตรงข้ามสองมุม',
-      zone: 'Zone: คลิกอย่างน้อย 3 จุด แล้วคลิกจุดแรกหรือกด Enter',
-      anchor: 'Anchor: คลิกตำแหน่งติดตั้ง',
-      dimension: 'Dimension: ลากระหว่างสองจุด',
+      zone: 'Zone: คลิกอย่างน้อย 3 จุด แล้ว double click เพื่อจบ polygon',
+      anchor: 'Anchor: ตั้งค่า ID / Z / Mount height แล้วคลิกตำแหน่งติดตั้ง',
+      dimension: 'Dimension: คลิกจุดเริ่ม แล้วคลิกจุดปลาย',
     };
     setMessage(help[tool] || '');
-    renderDraft();
+    renderScene();
   }
 
   async function safeMutation(action, successMessage) {
@@ -613,8 +742,75 @@
     }
   }
 
-  async function createZone(points) {
-    const name = `Zone ${state.zones.length + 1}`;
+  function nextZoneName() {
+    const names = new Set(state.zones.map(zone => String(zone.name).toLowerCase()));
+    let number = 1;
+    while (names.has(`zone ${number}`)) number += 1;
+    return `Zone ${number}`;
+  }
+
+  function requestZoneName(defaultName) {
+    return new Promise(resolve => {
+      state.zoneNameOpen = true;
+      const backdrop = document.createElement('div');
+      backdrop.className = 'modal-back';
+      backdrop.innerHTML = `
+        <form class="modal zone-name-modal">
+          <div class="modal-head">
+            <span class="modal-title">กำหนดชื่อ Zone</span>
+            <button class="x" type="button" data-close aria-label="ปิด">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div class="field">
+              <label class="label">Zone name</label>
+              <input class="control" name="zone-name" maxlength="200" required>
+            </div>
+            <div class="err" data-error hidden>กรุณาระบุชื่อ Zone</div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn" type="button" data-close>ยกเลิก</button>
+            <button class="btn btn-primary" type="submit">บันทึก Zone</button>
+          </div>
+        </form>`;
+      document.body.appendChild(backdrop);
+      const form = backdrop.querySelector('form');
+      const input = backdrop.querySelector('[name="zone-name"]');
+      const error = backdrop.querySelector('[data-error]');
+      input.value = defaultName;
+      input.select();
+
+      const close = value => {
+        state.zoneNameOpen = false;
+        backdrop.remove();
+        resolve(value);
+      };
+      backdrop.querySelectorAll('[data-close]').forEach(button => {
+        button.addEventListener('click', () => close(null));
+      });
+      backdrop.addEventListener('click', event => {
+        if (event.target === backdrop) close(null);
+      });
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        const name = input.value.trim();
+        if (!name) {
+          error.hidden = false;
+          input.focus();
+          return;
+        }
+        close(name);
+      });
+      form.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          close(null);
+        }
+      });
+    });
+  }
+
+  async function createZone(points, name) {
     const response = await safeMutation(
       () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/zones`, {
         method: 'POST',
@@ -634,29 +830,100 @@
       .filter(Boolean)
       .map(match => Number(match[1]));
     const number = Math.max(0, ...numbers) + 1;
-    return `A${String(number).padStart(2, '0')}`;
+    return `A${number}`;
+  }
+
+  function optionalMetres(input, label, minimum = null) {
+    const text = input.value.trim();
+    if (!text) return null;
+    const value = Number(text);
+    if (!Number.isFinite(value) || (minimum !== null && value < minimum)) {
+      throw new Error(`${label} ต้องเป็นตัวเลข${minimum === null ? '' : `ตั้งแต่ ${minimum}`} เมตร`);
+    }
+    return value;
   }
 
   async function createAnchor(point) {
-    const anchorId = nextAnchorId();
+    let anchorId;
+    let z;
+    let mountHeight;
+    try {
+      anchorId = ui.anchorIdInput.value.trim() || nextAnchorId();
+      z = optionalMetres(ui.anchorZInput, 'Z');
+      mountHeight = optionalMetres(ui.anchorMountInput, 'Mount height', 0);
+    } catch (error) {
+      setMessage(error.message, 'error');
+      return;
+    }
+    if (state.anchors.some(anchor => String(anchor.anchor_id).toLowerCase() === anchorId.toLowerCase())) {
+      setMessage(`Anchor ${anchorId} มีอยู่แล้ว`, 'error');
+      return;
+    }
     const response = await safeMutation(
       () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/anchors`, {
         method: 'POST',
-        body: JSON.stringify({ anchor_id: anchorId, x: point.x, y: point.y }),
+        body: JSON.stringify({
+          anchor_id: anchorId,
+          x: point.x,
+          y: point.y,
+          z,
+          mount_height_m: mountHeight,
+        }),
       }),
       `${anchorId} บันทึกแล้ว`,
     );
     if (response?.anchor) {
       state.anchors.push(response.anchor);
+      ui.anchorIdInput.value = '';
       selectEntity('anchor', response.anchor.anchor_id);
     }
   }
 
+  async function saveAnchorProperties() {
+    const anchor = entityBySelection();
+    if (!anchor || state.selected?.kind !== 'anchor') return;
+    let z;
+    let mountHeight;
+    try {
+      z = optionalMetres(ui.anchorZInput, 'Z');
+      mountHeight = optionalMetres(ui.anchorMountInput, 'Mount height', 0);
+    } catch (error) {
+      setMessage(error.message, 'error');
+      return;
+    }
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/anchors`, {
+        method: 'POST',
+        body: JSON.stringify({
+          anchor_id: anchor.anchor_id,
+          x: Number(anchor.x),
+          y: Number(anchor.y),
+          z,
+          mount_height_m: mountHeight,
+          battery: anchor.battery,
+        }),
+      }),
+      `${anchor.anchor_id} properties บันทึกแล้ว`,
+    );
+    if (response?.anchor) {
+      Object.assign(anchor, response.anchor);
+      renderScene();
+    }
+  }
+
   async function createDimension(start, end) {
+    const { length, angle } = measurement(start, end);
     const response = await safeMutation(
       () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/dimensions`, {
         method: 'POST',
-        body: JSON.stringify({ x1: start.x, y1: start.y, x2: end.x, y2: end.y }),
+        body: JSON.stringify({
+          x1: start.x,
+          y1: start.y,
+          x2: end.x,
+          y2: end.y,
+          length_m: length,
+          angle_deg: angle,
+        }),
       }),
       'Dimension บันทึกแล้ว',
     );
@@ -664,6 +931,41 @@
       state.dimensions.push(response.dimension);
       selectEntity('dimension', response.dimension.dimension_id);
     }
+  }
+
+  async function saveLineProperties() {
+    const object = entityBySelection();
+    const points = state.selected?.kind === 'object' ? linePoints(object) : [];
+    if (!object || points.length !== 2 || !state.canEdit) return;
+
+    const length = Number(ui.lineLengthInput.value);
+    const angle = Number(ui.lineAngleInput.value);
+    if (!Number.isFinite(length) || length <= 0) {
+      setMessage('Line Length ต้องมากกว่า 0 เมตร', 'error');
+      return;
+    }
+    if (!Number.isFinite(angle)) {
+      setMessage('Line Angle ต้องเป็นตัวเลขหน่วย degree', 'error');
+      return;
+    }
+
+    const radians = angle * Math.PI / 180;
+    const start = points[0];
+    const end = {
+      x: start.x + length * Math.cos(radians),
+      y: start.y + length * Math.sin(radians),
+    };
+    const geometry = geometryFromPoints('line', [start, end]);
+    const properties = { ...(object.properties || {}), length_m: length, angle_deg: angle };
+    const response = await safeMutation(
+      () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/objects/${encodeURIComponent(object.object_id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ geometry, properties }),
+      }),
+      'Line properties บันทึกแล้ว',
+    );
+    if (response?.object) Object.assign(object, response.object);
+    renderScene();
   }
 
   function translatedGeometry(geometry, dx, dy) {
@@ -721,15 +1023,41 @@
     return Math.hypot(a.x - b.x, a.y - b.y);
   }
 
+  function uniquePolygonPoints(points) {
+    const tolerance = Math.max(metresPerPixel() * 2, 1e-9);
+    const unique = [];
+    points.forEach(point => {
+      if (!unique.length || distance(point, unique[unique.length - 1]) > tolerance) {
+        unique.push(point);
+      }
+    });
+    if (unique.length > 1 && distance(unique[0], unique[unique.length - 1]) <= tolerance) {
+      unique.pop();
+    }
+    return unique;
+  }
+
+  async function finishZoneWithName(points) {
+    const name = await requestZoneName(nextZoneName());
+    if (!name) {
+      state.draft = { kind: 'zone', points, cursor: points[points.length - 1] || null };
+      renderDraft();
+      setMessage('ยังไม่ได้บันทึก Zone — วาดต่อหรือกด Enter เพื่อกำหนดชื่อ');
+      return;
+    }
+    await createZone(points, name);
+  }
+
   function finishZone() {
-    if (state.tool !== 'zone' || !state.draft || state.draft.points.length < 3) {
+    if (state.zoneNameOpen) return;
+    const points = uniquePolygonPoints(state.draft?.points || []);
+    if (state.tool !== 'zone' || points.length < 3) {
       setMessage('Zone ต้องมีอย่างน้อย 3 จุด', 'error');
       return;
     }
-    const points = state.draft.points.slice();
     state.draft = { kind: 'zone', points: [], cursor: null };
     renderDraft();
-    void createZone(points);
+    void finishZoneWithName(points);
   }
 
   function cancelInteraction() {
@@ -804,11 +1132,36 @@
       }
       return;
     }
-    if (state.tool === 'line' || state.tool === 'rectangle' || state.tool === 'dimension') {
+    if (state.tool === 'dimension') {
+      if (state.draft?.kind !== 'dimension' || !state.draft.start) {
+        state.draft = { kind: 'dimension', start: point, end: point };
+        setMessage(`Dimension start: X ${point.x.toFixed(2)} · Y ${point.y.toFixed(2)} m — คลิกจุดปลาย`);
+        renderDraft();
+        return;
+      }
+      const start = state.draft.start;
+      if (distance(start, point) <= 1e-9) {
+        state.draft.end = point;
+        setMessage('จุดปลาย Dimension ต้องต่างจากจุดเริ่ม', 'error');
+        renderDraft();
+        return;
+      }
+      state.draft = null;
+      renderDraft();
+      void createDimension(start, point);
+      return;
+    }
+    if (state.tool === 'line' || state.tool === 'rectangle') {
       state.draft = { kind: state.tool, start: point, end: point };
       ui.svg.setPointerCapture(event.pointerId);
       renderDraft();
     }
+  }
+
+  function onDoubleClick(event) {
+    if (state.tool !== 'zone' || !state.canEdit || state.zoneNameOpen) return;
+    event.preventDefault();
+    finishZone();
   }
 
   function onPointerMove(event) {
@@ -860,14 +1213,14 @@
     }
     const draft = state.draft;
     if (!draft?.start || !draft.end) return;
+    if (draft.kind === 'dimension') return;
     state.draft = null;
     renderDraft();
     if (distance(draft.start, draft.end) < state.gridStep * 0.05) {
       setMessage('ระยะสั้นเกินไป จึงยังไม่ได้สร้างวัตถุ', 'error');
       return;
     }
-    if (draft.kind === 'dimension') void createDimension(draft.start, draft.end);
-    else void createObject(draft.kind, draft.start, draft.end);
+    void createObject(draft.kind, draft.start, draft.end);
     try { ui.svg.releasePointerCapture(event.pointerId); } catch (_error) { /* already released */ }
   }
 
@@ -891,6 +1244,8 @@
     document.getElementById('tool-fit').addEventListener('click', fitView);
     document.getElementById('tool-zoom-in').addEventListener('click', () => zoomAt(0.8));
     document.getElementById('tool-zoom-out').addEventListener('click', () => zoomAt(1.25));
+    ui.saveAnchorProperties.addEventListener('click', () => void saveAnchorProperties());
+    ui.saveLineProperties.addEventListener('click', () => void saveLineProperties());
     ui.gridSize.addEventListener('change', () => {
       const value = Number(ui.gridSize.value);
       if (!Number.isFinite(value) || value <= 0) {
@@ -905,6 +1260,7 @@
     ui.svg.addEventListener('pointerdown', onPointerDown);
     ui.svg.addEventListener('pointermove', onPointerMove);
     ui.svg.addEventListener('pointerup', onPointerUp);
+    ui.svg.addEventListener('dblclick', onDoubleClick);
     ui.svg.addEventListener('pointercancel', cancelInteraction);
     ui.svg.addEventListener('contextmenu', event => event.preventDefault());
     ui.svg.addEventListener('wheel', event => {
@@ -1034,6 +1390,11 @@
     }
     await loadPlan(planId);
   }
+
+  window.SUPALAI_PLAN_EDITOR = Object.freeze({
+    pointInPolygon,
+    zoneAtPoint,
+  });
 
   void initialise().catch(error => {
     showLoading(`เปิด Plan Editor ไม่สำเร็จ: ${error?.message || error}`, true);

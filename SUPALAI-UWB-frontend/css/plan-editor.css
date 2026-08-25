@@ -252,6 +252,14 @@
   font-variant-numeric: tabular-nums;
 }
 
+.anchor-settings .field { margin-top: 9px; }
+.anchor-settings .field-row { margin-top: 9px; }
+.anchor-settings .sub > span { min-height: 34px; display: flex; align-items: flex-end; }
+#save-anchor-properties { margin-top: 12px; }
+.line-settings .field-row { margin-top: 9px; }
+.line-settings .sub > span { min-height: 34px; display: flex; align-items: flex-end; }
+#save-line-properties { margin-top: 12px; }
+
 .input-with-unit { display: flex; align-items: center; gap: 8px; }
 .input-with-unit .control { min-width: 0; }
 .input-with-unit > span { color: var(--muted); font-size: 12px; }

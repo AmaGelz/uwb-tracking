@@ -24,6 +24,7 @@ import psycopg2
 import psycopg2.extras
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 SCHEMA_SQL = REPO_ROOT / "database" / "schema.sql"
 SEED_SQL = REPO_ROOT / "database" / "seed.sql"
 
@@ -63,6 +64,31 @@ def apply_schema(conn) -> None:
         cur.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
     conn.commit()
     print("  schema OK")
+
+
+def apply_migrations(conn) -> None:
+    if not MIGRATIONS_DIR.exists():
+        print("No migrations directory found, skipping.")
+        return
+
+    files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+    if not files:
+        print("No migrations found.")
+        return
+
+    for migration_file in files:
+        print(f"Applying {migration_file.relative_to(REPO_ROOT)} ...")
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_file.read_text(encoding="utf-8"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        print(f"  {migration_file.name} OK")
 
 
 def apply_seed(conn) -> None:
@@ -140,10 +166,16 @@ def main() -> None:
 
     try:
         apply_schema(conn)
+
         if args.seed:
             apply_seed(conn)
+
         if args.from_sqlite:
             migrate_from_sqlite(conn, Path(args.from_sqlite))
+
+        # Run migrations after optional legacy imports so their backfills also
+        # cover rows imported by this invocation.
+        apply_migrations(conn)
     finally:
         conn.close()
 

@@ -829,6 +829,14 @@ def frontend_dashboard():
     raise HTTPException(status_code=404)
 
 
+@app.get("/plan-editor.html", include_in_schema=False)
+def frontend_plan_editor():
+    file = FRONTEND_DIR / "plan-editor.html"
+    if file.exists():
+        return FileResponse(file)
+    raise HTTPException(status_code=404)
+
+
 try:
     from fastapi.staticfiles import StaticFiles
 
