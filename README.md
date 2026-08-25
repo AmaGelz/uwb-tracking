@@ -1,4 +1,4 @@
-# SUPALAI-UWB
+# UWB
 
 Indoor UWB (ultra-wideband) tracking dashboard for sales-gallery visits:
 live floor-plan positions, per-visit dwell/timeline, and sales analytics
