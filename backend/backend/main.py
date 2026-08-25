@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from psycopg2.errors import UniqueViolation
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 import calculations
 import positioning
@@ -39,6 +41,13 @@ app.add_middleware(
 # Request bodies
 # ---------------------------------------------------------------------
 
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class PlanEditorModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
 class SignInRequest(BaseModel):
     email: str
     password: str
@@ -63,6 +72,65 @@ class AnchorCreate(BaseModel):
     x: float
     y: float
     battery: float | None = None
+
+
+class PlanCreate(PlanEditorModel):
+    plan_id: NonEmptyText
+    name: NonEmptyText
+    width_m: float = Field(default=20.0, gt=0)
+    height_m: float = Field(default=20.0, gt=0)
+    is_active: bool = False
+    version: int = Field(default=1, ge=1)
+
+
+class PlanUpdate(PlanEditorModel):
+    name: NonEmptyText | None = None
+    width_m: float | None = Field(default=None, gt=0)
+    height_m: float | None = Field(default=None, gt=0)
+    is_active: bool | None = None
+    version: int | None = Field(default=None, ge=1)
+
+
+class PlanObjectCreate(PlanEditorModel):
+    object_type: NonEmptyText
+    label: str | None = None
+    geometry: dict[str, Any]
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class PlanObjectUpdate(PlanEditorModel):
+    object_type: NonEmptyText | None = None
+    label: str | None = None
+    geometry: dict[str, Any] | None = None
+    properties: dict[str, Any] | None = None
+
+
+class PlanZoneCreate(PlanEditorModel):
+    name: NonEmptyText
+    geometry: dict[str, Any] | None = None
+    x_min: float | None = None
+    x_max: float | None = None
+    y_min: float | None = None
+    y_max: float | None = None
+
+
+class PlanAnchorCreate(PlanEditorModel):
+    anchor_id: NonEmptyText
+    x: float
+    y: float
+    z: float | None = None
+    mount_height_m: float | None = Field(default=None, ge=0)
+    battery: float | None = None
+
+
+class PlanDimensionCreate(PlanEditorModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    length_m: float | None = Field(default=None, ge=0)
+    angle_deg: float | None = None
+    label: str | None = None
 
 
 class VisitMeta(BaseModel):
@@ -111,6 +179,72 @@ def require_role(x_session: str | None, roles: set[str]) -> dict[str, Any]:
     if user["role"] not in roles:
         raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงข้อมูลนี้")
     return user
+
+
+def require_plan(plan_id: str) -> dict[str, Any]:
+    plan = q.get_plan(plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return plan
+
+
+def normalise_zone(payload: PlanZoneCreate) -> dict[str, Any]:
+    data = payload.model_dump()
+    geometry = data.get("geometry")
+
+    if geometry is not None:
+        points = geometry.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            raise HTTPException(status_code=422, detail="geometry.points ต้องมีอย่างน้อย 3 จุด")
+
+        coordinates: list[tuple[float, float]] = []
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                raise HTTPException(status_code=422, detail="แต่ละจุดใน geometry.points ต้องเป็น [x, y]")
+            x, y = point[0], point[1]
+            if (
+                isinstance(x, bool) or isinstance(y, bool)
+                or not isinstance(x, (int, float)) or not isinstance(y, (int, float))
+                or not math.isfinite(float(x)) or not math.isfinite(float(y))
+            ):
+                raise HTTPException(status_code=422, detail="พิกัด geometry ต้องเป็นตัวเลขที่มีค่าจำกัด")
+            coordinates.append((float(x), float(y)))
+
+        data["x_min"] = min(x for x, _y in coordinates)
+        data["x_max"] = max(x for x, _y in coordinates)
+        data["y_min"] = min(y for _x, y in coordinates)
+        data["y_max"] = max(y for _x, y in coordinates)
+    else:
+        bounds = (data.get("x_min"), data.get("x_max"), data.get("y_min"), data.get("y_max"))
+        if any(value is None for value in bounds):
+            raise HTTPException(
+                status_code=422,
+                detail="ต้องระบุ geometry หรือ x_min, x_max, y_min, y_max ให้ครบ",
+            )
+        data["geometry"] = {
+            "type": "polygon",
+            "points": [
+                [data["x_min"], data["y_min"]],
+                [data["x_max"], data["y_min"]],
+                [data["x_max"], data["y_max"]],
+                [data["x_min"], data["y_max"]],
+            ],
+        }
+
+    if data["x_min"] >= data["x_max"] or data["y_min"] >= data["y_max"]:
+        raise HTTPException(status_code=422, detail="ขอบเขต zone ต้องมีความกว้างและความสูงมากกว่า 0")
+    return data
+
+
+def normalise_dimension(payload: PlanDimensionCreate) -> dict[str, Any]:
+    data = payload.model_dump()
+    dx = payload.x2 - payload.x1
+    dy = payload.y2 - payload.y1
+    if data["length_m"] is None:
+        data["length_m"] = math.hypot(dx, dy)
+    if data["angle_deg"] is None:
+        data["angle_deg"] = math.degrees(math.atan2(dy, dx))
+    return data
 
 
 def _query_params(province, project, plan, employee, customer, from_date, to_date) -> dict[str, str]:
@@ -376,6 +510,25 @@ def projects(x_session: str | None = Header(default=None)):
     return {"ok": True, "projects": q.get_projects()}
 
 
+@app.get("/api/projects/{project_id}/plans")
+def project_plans(project_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    if not q.get_project(project_id):
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    return {"ok": True, "plans": q.get_plans(project_id)}
+
+
+@app.post("/api/projects/{project_id}/plans")
+def plan_create(project_id: str, payload: PlanCreate, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    if not q.get_project(project_id):
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    plan = q.create_plan(project_id, payload.model_dump())
+    if not plan:
+        raise HTTPException(status_code=409, detail="plan_id หรือชื่อแปลนซ้ำในโครงการ")
+    return {"ok": True, "plan": plan}
+
+
 @app.get("/api/projects/{project_id}")
 def project_detail(project_id: str, x_session: str | None = Header(default=None)):
     require_user(x_session)
@@ -383,6 +536,151 @@ def project_detail(project_id: str, x_session: str | None = Header(default=None)
     if not project:
         raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
     return project
+
+
+@app.get("/api/plans/{plan_id}")
+def plan_detail(plan_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    return {"ok": True, "plan": require_plan(plan_id)}
+
+
+@app.put("/api/plans/{plan_id}")
+def plan_update(plan_id: str, payload: PlanUpdate, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    data = {
+        key: value
+        for key, value in payload.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    if not data:
+        raise HTTPException(status_code=400, detail="ไม่มีข้อมูลสำหรับแก้ไขแปลน")
+    try:
+        plan = q.update_plan(plan_id, data)
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="ชื่อแปลนซ้ำในโครงการ") from exc
+    if not plan:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return {"ok": True, "plan": plan}
+
+
+@app.get("/api/plans/{plan_id}/objects")
+def plan_objects(plan_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    require_plan(plan_id)
+    return {"ok": True, "objects": q.get_plan_objects(plan_id)}
+
+
+@app.post("/api/plans/{plan_id}/objects")
+def plan_object_create(
+    plan_id: str,
+    payload: PlanObjectCreate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    plan_object = q.create_plan_object(plan_id, payload.model_dump())
+    if not plan_object:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return {"ok": True, "object": plan_object}
+
+
+@app.put("/api/plans/{plan_id}/objects/{object_id}")
+def plan_object_update(
+    plan_id: str,
+    object_id: int,
+    payload: PlanObjectUpdate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="ไม่มีข้อมูลสำหรับแก้ไข object")
+    if any(data.get(key) is None for key in {"object_type", "geometry", "properties"} if key in data):
+        raise HTTPException(status_code=422, detail="object_type, geometry และ properties ห้ามเป็น null")
+    plan_object = q.update_plan_object(plan_id, object_id, data)
+    if not plan_object:
+        raise HTTPException(status_code=404, detail="ไม่พบ object ในแปลนนี้")
+    return {"ok": True, "object": plan_object}
+
+
+@app.delete("/api/plans/{plan_id}/objects/{object_id}")
+def plan_object_delete(
+    plan_id: str,
+    object_id: int,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    if not q.delete_plan_object(plan_id, object_id):
+        raise HTTPException(status_code=404, detail="ไม่พบ object ในแปลนนี้")
+    return {"ok": True}
+
+
+@app.get("/api/plans/{plan_id}/zones")
+def plan_zones(plan_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    require_plan(plan_id)
+    return {"ok": True, "zones": q.get_plan_zones(plan_id)}
+
+
+@app.post("/api/plans/{plan_id}/zones")
+def plan_zone_create(
+    plan_id: str,
+    payload: PlanZoneCreate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    try:
+        zone = q.create_plan_zone(plan_id, normalise_zone(payload))
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="ชื่อ zone ซ้ำในโครงการ") from exc
+    if not zone:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return {"ok": True, "zone": zone}
+
+
+@app.get("/api/plans/{plan_id}/anchors")
+def plan_anchors(plan_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    require_plan(plan_id)
+    return {"ok": True, "anchors": q.get_plan_anchors(plan_id)}
+
+
+@app.post("/api/plans/{plan_id}/anchors")
+def plan_anchor_create(
+    plan_id: str,
+    payload: PlanAnchorCreate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    anchor = q.create_plan_anchor(plan_id, payload.model_dump())
+    if not anchor:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return {"ok": True, "anchor": anchor}
+
+
+@app.get("/api/plans/{plan_id}/dimensions")
+def plan_dimensions(plan_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    require_plan(plan_id)
+    return {"ok": True, "dimensions": q.get_plan_dimensions(plan_id)}
+
+
+@app.post("/api/plans/{plan_id}/dimensions")
+def plan_dimension_create(
+    plan_id: str,
+    payload: PlanDimensionCreate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    dimension = q.create_plan_dimension(plan_id, normalise_dimension(payload))
+    if not dimension:
+        raise HTTPException(status_code=404, detail="ไม่พบแปลน")
+    return {"ok": True, "dimension": dimension}
 
 
 @app.post("/api/projects/{project_id}/anchors")

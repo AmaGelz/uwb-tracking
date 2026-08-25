@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -80,6 +81,304 @@ def get_project(project_id: str) -> dict[str, Any] | None:
             row["zones"] = get_zones(project_id)
             return row
     return None
+
+
+# ---------------------------------------------------------------------
+# Plan editor
+# ---------------------------------------------------------------------
+
+def get_plans(project_id: str) -> list[dict[str, Any]]:
+    return db.fetchall(
+        """
+        SELECT id AS plan_id, project_id, name, width_m, height_m,
+               is_active, version, created_at, updated_at
+        FROM plans
+        WHERE project_id = %s
+        ORDER BY is_active DESC, name, id
+        """,
+        (project_id,),
+    )
+
+
+def get_plan(plan_id: str) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        SELECT id AS plan_id, project_id, name, width_m, height_m,
+               is_active, version, created_at, updated_at
+        FROM plans
+        WHERE id = %s
+        """,
+        (plan_id,),
+    )
+
+
+def create_plan(project_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        WITH inserted AS (
+            INSERT INTO plans (
+                id, project_id, name, width_m, height_m, is_active, version
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING *
+        ), deactivated AS (
+            UPDATE plans AS p
+            SET is_active = false, updated_at = now()
+            FROM inserted AS i
+            WHERE i.is_active
+              AND p.project_id = i.project_id
+              AND p.id <> i.id
+            RETURNING p.id
+        ), synced_project AS (
+            UPDATE projects AS p
+            SET plan_id = i.id,
+                plan_name = i.name,
+                width_m = i.width_m,
+                height_m = i.height_m
+            FROM inserted AS i
+            WHERE i.is_active AND p.id = i.project_id
+            RETURNING p.id
+        )
+        SELECT id AS plan_id, project_id, name, width_m, height_m,
+               is_active, version, created_at, updated_at
+        FROM inserted
+        """,
+        (
+            data["plan_id"], project_id, data["name"],
+            data["width_m"], data["height_m"],
+            data.get("is_active", False), data.get("version", 1),
+        ),
+    )
+
+
+def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"name", "width_m", "height_m", "is_active", "version"}
+    changes = [(key, value) for key, value in data.items() if key in allowed]
+    if not changes:
+        return get_plan(plan_id)
+
+    assignments = ", ".join(f"{key} = %s" for key, _value in changes)
+    params = [value for _key, value in changes]
+    params.append(plan_id)
+
+    return db.fetchone(
+        f"""
+        WITH updated AS (
+            UPDATE plans
+            SET {assignments}, updated_at = now()
+            WHERE id = %s
+            RETURNING *
+        ), deactivated AS (
+            UPDATE plans AS p
+            SET is_active = false, updated_at = now()
+            FROM updated AS u
+            WHERE u.is_active
+              AND p.project_id = u.project_id
+              AND p.id <> u.id
+            RETURNING p.id
+        ), synced_project AS (
+            UPDATE projects AS p
+            SET plan_id = u.id,
+                plan_name = u.name,
+                width_m = u.width_m,
+                height_m = u.height_m
+            FROM updated AS u
+            WHERE u.is_active AND p.id = u.project_id
+            RETURNING p.id
+        )
+        SELECT id AS plan_id, project_id, name, width_m, height_m,
+               is_active, version, created_at, updated_at
+        FROM updated
+        """,
+        tuple(params),
+    )
+
+
+def get_plan_objects(plan_id: str) -> list[dict[str, Any]]:
+    return db.fetchall(
+        """
+        SELECT id AS object_id, plan_id, object_type, label, geometry,
+               properties, created_at, updated_at
+        FROM plan_objects
+        WHERE plan_id = %s
+        ORDER BY id
+        """,
+        (plan_id,),
+    )
+
+
+def create_plan_object(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        INSERT INTO plan_objects (plan_id, object_type, label, geometry, properties)
+        SELECT id, %s, %s, %s::jsonb, %s::jsonb
+        FROM plans
+        WHERE id = %s
+        RETURNING id AS object_id, plan_id, object_type, label, geometry,
+                  properties, created_at, updated_at
+        """,
+        (
+            data["object_type"], data.get("label"), json.dumps(data["geometry"]),
+            json.dumps(data.get("properties", {})), plan_id,
+        ),
+    )
+
+
+def update_plan_object(plan_id: str, object_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"object_type", "label", "geometry", "properties"}
+    changes = [(key, value) for key, value in data.items() if key in allowed]
+    if not changes:
+        return None
+
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes:
+        if key in {"geometry", "properties"}:
+            assignments.append(f"{key} = %s::jsonb")
+            params.append(json.dumps(value))
+        else:
+            assignments.append(f"{key} = %s")
+            params.append(value)
+    params.extend((plan_id, object_id))
+
+    return db.fetchone(
+        f"""
+        UPDATE plan_objects
+        SET {', '.join(assignments)}, updated_at = now()
+        WHERE plan_id = %s AND id = %s
+        RETURNING id AS object_id, plan_id, object_type, label, geometry,
+                  properties, created_at, updated_at
+        """,
+        tuple(params),
+    )
+
+
+def delete_plan_object(plan_id: str, object_id: int) -> bool:
+    row = db.execute_returning(
+        "DELETE FROM plan_objects WHERE plan_id = %s AND id = %s RETURNING id",
+        (plan_id, object_id),
+    )
+    return row is not None
+
+
+def get_plan_zones(plan_id: str) -> list[dict[str, Any]]:
+    return db.fetchall(
+        """
+        SELECT id AS zone_id, plan_id, project_id, name,
+               x_min, x_max, y_min, y_max, geometry
+        FROM zones
+        WHERE plan_id = %s
+        ORDER BY id
+        """,
+        (plan_id,),
+    )
+
+
+def create_plan_zone(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        INSERT INTO zones (
+            project_id, plan_id, name, x_min, x_max, y_min, y_max, geometry
+        )
+        SELECT project_id, id, %s, %s, %s, %s, %s, %s::jsonb
+        FROM plans
+        WHERE id = %s
+        RETURNING id AS zone_id, plan_id, project_id, name,
+                  x_min, x_max, y_min, y_max, geometry
+        """,
+        (
+            data["name"], data["x_min"], data["x_max"],
+            data["y_min"], data["y_max"], json.dumps(data["geometry"]), plan_id,
+        ),
+    )
+
+
+def get_plan_anchors(plan_id: str) -> list[dict[str, Any]]:
+    rows = db.fetchall(
+        """
+        SELECT anchor_id, project_id, plan_id, x, y, z, mount_height_m,
+               battery, last_ts
+        FROM anchors
+        WHERE plan_id = %s
+        ORDER BY anchor_id
+        """,
+        (plan_id,),
+    )
+    now = utc_now()
+    for anchor in rows:
+        anchor["on"] = bool(
+            anchor["last_ts"]
+            and (now - anchor["last_ts"]).total_seconds() <= ANCHOR_ONLINE_SEC
+        )
+        anchor["last_ts"] = to_epoch(anchor["last_ts"])
+    return rows
+
+
+def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    row = db.fetchone(
+        """
+        INSERT INTO anchors (
+            project_id, plan_id, anchor_id, x, y, z, mount_height_m,
+            battery, last_ts
+        )
+        SELECT project_id, id, %s, %s, %s, %s, %s, %s, %s
+        FROM plans
+        WHERE id = %s
+        ON CONFLICT (project_id, anchor_id)
+        DO UPDATE SET
+            plan_id = EXCLUDED.plan_id,
+            x = EXCLUDED.x,
+            y = EXCLUDED.y,
+            z = EXCLUDED.z,
+            mount_height_m = EXCLUDED.mount_height_m,
+            battery = EXCLUDED.battery,
+            last_ts = EXCLUDED.last_ts
+        RETURNING anchor_id
+        """,
+        (
+            data["anchor_id"], data["x"], data["y"], data.get("z"),
+            data.get("mount_height_m"), data.get("battery"), utc_now(), plan_id,
+        ),
+    )
+    if not row:
+        return None
+    return next(
+        anchor for anchor in get_plan_anchors(plan_id)
+        if anchor["anchor_id"] == data["anchor_id"]
+    )
+
+
+def get_plan_dimensions(plan_id: str) -> list[dict[str, Any]]:
+    return db.fetchall(
+        """
+        SELECT id AS dimension_id, plan_id, x1, y1, x2, y2,
+               length_m, angle_deg, label, created_at, updated_at
+        FROM plan_dimensions
+        WHERE plan_id = %s
+        ORDER BY id
+        """,
+        (plan_id,),
+    )
+
+
+def create_plan_dimension(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        INSERT INTO plan_dimensions (
+            plan_id, x1, y1, x2, y2, length_m, angle_deg, label
+        )
+        SELECT id, %s, %s, %s, %s, %s, %s, %s
+        FROM plans
+        WHERE id = %s
+        RETURNING id AS dimension_id, plan_id, x1, y1, x2, y2,
+                  length_m, angle_deg, label, created_at, updated_at
+        """,
+        (
+            data["x1"], data["y1"], data["x2"], data["y2"],
+            data["length_m"], data.get("angle_deg", 0), data.get("label"), plan_id,
+        ),
+    )
 
 
 def get_zones(project_id: str) -> list[dict[str, Any]]:
