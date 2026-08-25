@@ -8,7 +8,7 @@ const db: any = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const ALLOWED_ORIGINS = new Set([
-  "https://amagelz.github.io",
+  "https://supalai-uwb-tracking.ordinary-plant.workers.dev",
   "https://jitmnaljkughkhmxeaov.supabase.co",
   "http://127.0.0.1:8765",
   "http://localhost:8765",
@@ -24,7 +24,7 @@ function corsHeaders(req: Request): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin)
       ? origin
-      : "https://amagelz.github.io",
+      : "https://supalai-uwb-tracking.ordinary-plant.workers.dev",
     "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Vary": "Origin",

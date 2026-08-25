@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "supalai-uwb-tracking",
+  "compatibility_date": "2026-08-25",
+  "assets": {
+    "directory": "./SUPALAI-UWB-frontend",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}

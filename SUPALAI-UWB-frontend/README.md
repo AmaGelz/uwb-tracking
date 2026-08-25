@@ -16,14 +16,15 @@ Production endpoints keep the existing `/api/...` contract through the
 Supabase Edge Function in `../supabase/functions/api`. The FastAPI backend is
 retained for local/legacy deployments.
 
-## Supabase deployment
+## Production deployment
 
-Supabase provides Auth, Postgres, Realtime, the Edge Function API and the
-public static site.
+Supabase provides Auth, Postgres, Realtime and the Edge Function API.
+Cloudflare Workers Static Assets serves the public frontend without requiring
+a Supabase custom-domain add-on.
 
-Deploy Supabase migrations, functions and Storage objects as described in
-`../supabase/README.md`. The production URL is
-`https://jitmnaljkughkhmxeaov.supabase.co/functions/v1/site/index.html`.
+Deploy the Supabase services as described in `../supabase/README.md`, then
+deploy the repository's `wrangler.jsonc` configuration. The production URL is
+`https://supalai-uwb-tracking.ordinary-plant.workers.dev`.
 
 If Google Sign-In is enabled, configure the Google provider in Supabase Auth
-and allow the production `site` Edge Function URL as a redirect URL.
+and allow the production Cloudflare URL as a redirect URL.
