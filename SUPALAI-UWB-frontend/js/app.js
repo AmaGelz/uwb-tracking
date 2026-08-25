@@ -12,7 +12,8 @@
  */
 'use strict';
 
-const { api, state: S, OfflineError } = window.SUPALAI_API;
+(() => {
+const { api: requestApi, state: S, OfflineError } = window.SUPALAI_API;
 
 /* ------------------------------------------------------------------ utils */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -438,8 +439,8 @@ async function pageOverview() {
   const q = rangeQuery();
   const isLead = S.user && (S.user.role === 'sale_lead' || S.user.role === 'admin');
   const [ov, dev, live, ana] = await Promise.all([
-    api('/api/overview' + q), api('/api/devices'), api('/api/live?since=0'),
-    isLead ? api('/api/analytics' + q).catch(() => null) : Promise.resolve(null),
+    requestApi('/api/overview' + q), requestApi('/api/devices'), requestApi('/api/live?since=0'),
+    isLead ? requestApi('/api/analytics' + q).catch(() => null) : Promise.resolve(null),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
@@ -508,7 +509,7 @@ async function pageOverview() {
 async function pageProject() {
   const q = rangeQuery();
   const [live, dev, vis] = await Promise.all([
-    api('/api/live?since=0'), api('/api/devices'), api('/api/visits' + q),
+    requestApi('/api/live?since=0'), requestApi('/api/devices'), requestApi('/api/visits' + q),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
@@ -562,7 +563,7 @@ async function pageProject() {
 
 async function pageSales() {
   const q = rangeQuery({ employee: S.filters.employee, customer: S.filters.customer });
-  const vis = await api('/api/visits' + q);
+  const vis = await requestApi('/api/visits' + q);
   const who = S.filters.employee
     ? (S.boot.people || []).find(p => p.employee_id === S.filters.employee)
     : S.user;
@@ -639,7 +640,7 @@ async function pageSales() {
 async function pageVisits() {
   const q = rangeQuery({ employee: S.filters.employee, customer: S.filters.customer });
   const [vis, heat] = await Promise.all([
-    api('/api/visits' + q), api('/api/heatmap' + q),
+    requestApi('/api/visits' + q), requestApi('/api/heatmap' + q),
   ]);
   const peak = heat.peak || 1;
 
@@ -695,7 +696,7 @@ async function pageVisits() {
 }
 
 async function pageVisitDetail(key) {
-  const d = await api('/api/visit?key=' + encodeURIComponent(key));
+  const d = await requestApi('/api/visit?key=' + encodeURIComponent(key));
   if (d.error) { render(`<div class="card"><div class="card-body">${esc(d.error)}</div></div>`); return; }
   /* The server decides this, not the browser -- a hidden button is not a
      permission. It is echoed back so the two can never disagree. */
@@ -784,7 +785,7 @@ async function pageVisitDetail(key) {
 
   const save = $('#v-save');
   if (save) save.onclick = async () => {
-    const r = await api('/api/visit-meta', {
+    const r = await requestApi('/api/visit-meta', {
       method: 'POST',
       body: JSON.stringify({ visit_key: key, customer_id: $('#v-cust').value,
                              deal_status: $('#v-deal').value }),
@@ -819,7 +820,7 @@ function noteModal(key) {
   back.onclick = ev => { if (ev.target === back) close(); };
   $('#m-body', back).focus();
   $('#m-save', back).onclick = async () => {
-    const r = await api('/api/note', {
+    const r = await requestApi('/api/note', {
       method: 'POST',
       body: JSON.stringify({ visit_key: key, body: $('#m-body', back).value }),
     });
@@ -830,7 +831,7 @@ function noteModal(key) {
 }
 
 async function pageDevices() {
-  const dev = await api('/api/devices');
+  const dev = await requestApi('/api/devices');
   render(`
     <div class="page-head"><h1>ตั้งค่าอุปกรณ์</h1>
       <span class="page-sub">พิกัด anchor เพิ่ม/แก้ไขผ่าน API จัดการโครงการ (สิทธิ์ admin)</span></div>
@@ -865,14 +866,15 @@ async function pageDevices() {
 }
 
 async function pageDeviceTracking() {
-  const [dev, live] = await Promise.all([api('/api/devices'), api('/api/live?since=0')]);
+  const [dev, live] = await Promise.all([requestApi('/api/devices'), requestApi('/api/live?since=0')]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
     Object.assign({ tag_id: id, label: t.sale_name || id }, t));
   const anchorStatus = Object.fromEntries(dev.anchors.map(a => [a.anchor_id, a.on]));
+  S.live.anchorStatus = anchorStatus;
 
   render(`
     <div class="page-head"><h1>ติดตามอุปกรณ์</h1>
-      <span class="page-sub">อัปเดตอัตโนมัติทุก 1 วินาที</span></div>
+      <span class="page-sub">WebSocket live · fallback polling เมื่อการเชื่อมต่อขัดข้อง</span></div>
     <div class="cols cols-filter-main">
       <div class="stack">
         ${filterCard(['province', 'project', 'plan'])}
@@ -921,46 +923,165 @@ async function pageDeviceTracking() {
 }
 
 /* ------------------------------------------------------------------ live */
-/* Tag positions move every second; anchor on/off does not. Polling both at
- * 1 Hz spent most of its effort re-answering the slow question, and each poll
- * also dragged along 400 rows of history the map never looks at.
- *
- * The timer is also re-armed only after a response lands, so a slow reply
- * cannot stack a queue of overlapping requests behind it. */
-const ANCHOR_REFRESH = 10;
+const LIVE_RECONNECT_MS = 2000;
+const LIVE_POLL_MS = 1000;
+
+function renderLiveSnapshot(live, channel) {
+  if (S.live.stopped) return;
+  const plan = $('#live-plan');
+  if (!plan) return stopLive();
+  const tags = Object.entries(live.tags || {}).map(([id, tag]) =>
+    Object.assign({ tag_id: id, label: tag.sale_name || id }, tag));
+  plan.innerHTML = planSVG({ tags, anchorStatus: S.live.anchorStatus || {} });
+  const clock = $('#live-clock');
+  if (clock) clock.textContent = `${channel} · อัปเดตล่าสุด ${fmtTime(live.now)}`;
+}
+
+function liveWebSocketUrl() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/live`;
+}
+
+function scheduleFallbackPoll(delay = LIVE_POLL_MS) {
+  if (S.live.stopped || !S.live.fallbackActive) return;
+  if (S.live.pollTimer) clearTimeout(S.live.pollTimer);
+  S.live.pollTimer = setTimeout(() => {
+    S.live.pollTimer = null;
+    void pollLiveFallback();
+  }, delay);
+}
+
+async function pollLiveFallback() {
+  if (S.live.stopped || !S.live.fallbackActive) return;
+  if (S.live.pollInFlight) return scheduleFallbackPoll(100);
+
+  S.live.pollInFlight = true;
+  const controller = new AbortController();
+  S.live.pollAbort = controller;
+  try {
+    const live = await requestApi('/api/live?rows=0', { signal: controller.signal });
+    if (S.live.fallbackActive && S.live.socket?.readyState !== 1) {
+      renderLiveSnapshot(live, 'Polling fallback');
+    }
+  } catch (_error) {
+    // The WebSocket reconnect loop remains active; a failed fallback request
+    // should not interrupt the rest of the dashboard.
+  } finally {
+    if (S.live.pollAbort === controller) S.live.pollAbort = null;
+    S.live.pollInFlight = false;
+    scheduleFallbackPoll();
+  }
+}
+
+function startFallbackPolling() {
+  if (S.live.stopped || S.live.fallbackActive) return;
+  S.live.fallbackActive = true;
+  scheduleFallbackPoll(0);
+}
+
+function stopFallbackPolling() {
+  S.live.fallbackActive = false;
+  if (S.live.pollTimer) {
+    clearTimeout(S.live.pollTimer);
+    S.live.pollTimer = null;
+  }
+  if (S.live.pollAbort) {
+    S.live.pollAbort.abort();
+    S.live.pollAbort = null;
+  }
+}
+
+function scheduleLiveReconnect() {
+  if (S.live.stopped || S.live.reconnectTimer) return;
+  S.live.reconnectTimer = setTimeout(() => {
+    S.live.reconnectTimer = null;
+    connectLiveWebSocket();
+  }, LIVE_RECONNECT_MS);
+}
+
+function connectLiveWebSocket() {
+  if (S.live.stopped || !S.token) return;
+  if (typeof WebSocket === 'undefined') {
+    startFallbackPolling();
+    return;
+  }
+  const active = S.live.socket;
+  if (active && (active.readyState === WebSocket.OPEN || active.readyState === WebSocket.CONNECTING)) return;
+
+  let socket;
+  try {
+    socket = new WebSocket(liveWebSocketUrl(), ['supalai.live', `session.${S.token}`]);
+  } catch (_error) {
+    startFallbackPolling();
+    scheduleLiveReconnect();
+    return;
+  }
+  S.live.socket = socket;
+  S.live.connectTimer = setTimeout(() => {
+    if (socket.readyState === WebSocket.CONNECTING) {
+      startFallbackPolling();
+      socket.close();
+    }
+  }, LIVE_RECONNECT_MS);
+
+  socket.onopen = () => {
+    if (S.live.socket !== socket || S.live.stopped) return socket.close();
+    if (S.live.connectTimer) {
+      clearTimeout(S.live.connectTimer);
+      S.live.connectTimer = null;
+    }
+    stopFallbackPolling();
+  };
+  socket.onmessage = event => {
+    if (S.live.socket !== socket || S.live.stopped) return;
+    try {
+      const message = JSON.parse(event.data);
+      if ((message.type === 'snapshot' || message.type === 'tags') && message.tags) {
+        renderLiveSnapshot(message, 'WebSocket');
+      }
+    } catch (_error) { /* ignore malformed frames and keep the channel alive */ }
+  };
+  socket.onerror = () => {
+    if (S.live.socket !== socket || S.live.stopped) return;
+    startFallbackPolling();
+  };
+  socket.onclose = () => {
+    if (S.live.socket !== socket) return;
+    S.live.socket = null;
+    if (S.live.connectTimer) {
+      clearTimeout(S.live.connectTimer);
+      S.live.connectTimer = null;
+    }
+    if (!S.live.stopped) {
+      startFallbackPolling();
+      scheduleLiveReconnect();
+    }
+  };
+}
 
 function startLive() {
   stopLive();
   S.live.stopped = false;
-  S.live.tick = 0;
   S.live.anchorStatus = S.live.anchorStatus || {};
-
-  const poll = async () => {
-    if (S.live.stopped) return;
-    const plan = $('#live-plan');
-    if (!plan) return stopLive();
-    try {
-      const live = await api('/api/live?rows=0');
-      if (S.live.tick % ANCHOR_REFRESH === 0) {
-        const dev = await api('/api/devices');
-        S.live.anchorStatus =
-          Object.fromEntries(dev.anchors.map(a => [a.anchor_id, a.on]));
-      }
-      S.live.tick++;
-      const tags = Object.entries(live.tags || {}).map(([id, t]) =>
-        Object.assign({ tag_id: id, label: t.sale_name || id }, t));
-      plan.innerHTML = planSVG({ tags, anchorStatus: S.live.anchorStatus });
-      const clock = $('#live-clock');
-      if (clock) clock.textContent = 'อัปเดตล่าสุด ' + fmtTime(live.now);
-    } catch (e) { /* a dropped poll is not worth interrupting the page for */ }
-    if (!S.live.stopped) S.live.timer = setTimeout(poll, 1000);
-  };
-  poll();
+  S.live.fallbackActive = false;
+  S.live.pollInFlight = false;
+  connectLiveWebSocket();
 }
 
 function stopLive() {
   S.live.stopped = true;
-  if (S.live.timer) { clearTimeout(S.live.timer); S.live.timer = null; }
+  stopFallbackPolling();
+  if (S.live.reconnectTimer) {
+    clearTimeout(S.live.reconnectTimer);
+    S.live.reconnectTimer = null;
+  }
+  if (S.live.connectTimer) {
+    clearTimeout(S.live.connectTimer);
+    S.live.connectTimer = null;
+  }
+  const socket = S.live.socket;
+  S.live.socket = null;
+  if (socket && socket.readyState < 2) socket.close(1000, 'Live view stopped');
 }
 
 /* --------------------------------------------------------------- plumbing */
@@ -969,7 +1090,7 @@ function render(inner) {
   $('#app').innerHTML = shell(inner);
   const out = $('#logout');
   if (out) out.onclick = async () => {
-    try { await api('/api/signout', { method: 'POST' }); } catch (e) { /* going anyway */ }
+    try { await requestApi('/api/signout', { method: 'POST' }); } catch (e) { /* going anyway */ }
     localStorage.removeItem('tw_token');
     S.token = null; S.user = null;
     location.hash = '#/signin';
@@ -1010,7 +1131,7 @@ async function route() {
   if (!S.user) {
     if (S.token) {
       try {
-        const me = await api('/api/me');
+        const me = await requestApi('/api/me');
         S.user = me.user;
       } catch (e) { S.user = null; }
     }
@@ -1022,7 +1143,7 @@ async function route() {
     }
   }
   if (head === 'signin') { location.replace('login.html'); return; }
-  if (!S.boot) S.boot = await api('/api/bootstrap');
+  if (!S.boot) S.boot = await requestApi('/api/bootstrap');
 
   S.route = head;
   try {
@@ -1039,3 +1160,4 @@ async function route() {
 
 window.addEventListener('hashchange', route);
 route();
+})();

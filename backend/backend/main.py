@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from psycopg2.errors import UniqueViolation
@@ -16,9 +17,13 @@ import queries as q
 import tracking
 from config import settings
 from db import db, init_db, seed_demo_data
+from live_hub import LiveHub, session_token_from_protocol_header
 from security import create_token, password_verify, public_user
 from simulator import simulator
 from utils import utc_now
+
+
+live_hub = LiveHub(lambda: q.get_live_tags(rows=0), interval=0.25)
 
 app = FastAPI(
     title=settings.app_name,
@@ -263,6 +268,7 @@ def _query_params(province, project, plan, employee, customer, from_date, to_dat
 async def startup() -> None:
     init_db()
     seed_demo_data()
+    live_hub.start()
     if settings.simulator_enabled:
         simulator.start()
 
@@ -270,6 +276,7 @@ async def startup() -> None:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     simulator.stop()
+    await live_hub.stop()
 
 
 @app.get("/health")
@@ -413,6 +420,29 @@ def devices(x_session: str | None = Header(default=None)):
 def live(x_session: str | None = Header(default=None), since: float = 0, rows: int = 400):
     require_user(x_session)
     return q.get_live_tags(rows=rows, since=since)
+
+
+def websocket_session_token(websocket: WebSocket) -> str | None:
+    """Read the existing session token from the browser WebSocket protocols."""
+    return session_token_from_protocol_header(websocket.headers.get("sec-websocket-protocol", ""))
+
+
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    token = websocket_session_token(websocket)
+    user = await asyncio.to_thread(current_user, token)
+    if not user:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired session")
+        return
+
+    try:
+        await live_hub.connect(websocket)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await live_hub.disconnect(websocket)
 
 
 # ---------------------------------------------------------------------
