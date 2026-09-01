@@ -2,22 +2,31 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-platformio/
+.azure-cli-venv/
+.azure-pip-tmp/
+.azure-config/
+.github-cli/
+.github-cli.zip
+.pio-python311/
+.pio-platforms/
+.pio-logs/
+.pio-secrets/
 venv/
 .pytest_cache/
 *.egg-info/
 
-# Local scratch data (the app itself is stateless; everything lives in Postgres)
-data/local/*.db
-
-# Secrets — .env files here currently hold real Supabase credentials for this
-# project. Keep them out of version control; share them out of band instead.
+# Secrets — environment files may hold PostgreSQL credentials and hardware
+# signing keys. Keep them out of version control; share them out of band.
 .env
 backend/.env
+hardware/**/secrets.h
+hardware/**/ingest_secret.h
+.pio/
+.platformio/
+.pio-core/
 
 # Editors / OS
 .vscode/
 .idea/
 .DS_Store
-
-# Supabase CLI local link/cache (may contain connection metadata)
-supabase/.temp/

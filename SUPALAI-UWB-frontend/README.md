@@ -1,30 +1,19 @@
-# SUPALAI-UWB Frontend
+# SUPALAI-UWB frontend
 
-This frontend preserves the original SUPALAI tracking-v02 UX/UI: fixed white header, quiet left rail, neutral surfaces, thin borders, KPI tiles, tables, filters, floor plan, status badges and the original Sign In / Google flow.
+The frontend is static HTML/CSS/JavaScript and talks only to the FastAPI
+service. FastAPI owns authentication, authorization, live WebSockets, and all
+PostgreSQL access; database credentials must never be placed in this folder.
 
-Files:
-- index.html: entry/redirect
-- login.html: original-style Sign In
-- dashboard.html: dashboard shell + hash-routed screens
-- css/style.css: original app(2).css moved without redesign
-- js/runtime-config.js: public Supabase URL/publishable key and Edge Function origin
-- js/api.js: Supabase session state + Edge Function transport
-- js/auth.js: Supabase password/invite/Google sign-in
-- js/app.js: original dashboard rendering/routing
+`js/runtime-config.js` leaves `apiBaseUrl` empty for the normal same-origin
+deployment where FastAPI serves this directory. When hosting the static files
+separately, set it to the public HTTPS origin of FastAPI and add the frontend
+origin to `CORS_ORIGINS` on the API host.
 
-Production endpoints keep the existing `/api/...` contract through the
-Supabase Edge Function in `../supabase/functions/api`. The FastAPI backend is
-retained for local/legacy deployments.
+The relevant boundaries are:
 
-## Production deployment
+- `js/api.js`: API URL resolution, PostgreSQL-backed session token transport
+- `js/auth.js`: email/password and optional Google Identity sign-in via FastAPI
+- `js/app.js`: dashboard plus FastAPI WebSocket live updates/polling fallback
 
-Supabase provides Auth, Postgres, Realtime and the Edge Function API.
-Cloudflare Workers Static Assets serves the public frontend without requiring
-a Supabase custom-domain add-on.
-
-Deploy the Supabase services as described in `../supabase/README.md`, then
-deploy the repository's `wrangler.jsonc` configuration. The production URL is
-`https://supalai-uwb-tracking.ordinary-plant.workers.dev`.
-
-If Google Sign-In is enabled, configure the Google provider in Supabase Auth
-and allow the production Cloudflare URL as a redirect URL.
+Do not add `DATABASE_URL`, PostgreSQL passwords, or hardware secrets to
+`runtime-config.js`; all of those are server-side settings.

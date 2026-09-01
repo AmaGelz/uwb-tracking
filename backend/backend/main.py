@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import math
 from pathlib import Path
+import re
+import time
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from psycopg2 import Error as DatabaseError
 from psycopg2.errors import UniqueViolation
+from psycopg2.extras import Json
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 import calculations
@@ -74,6 +82,8 @@ class ProjectCreate(BaseModel):
 
 class AnchorCreate(BaseModel):
     anchor_id: str
+    plan_id: str | None = None
+    hardware_address: str | None = None
     x: float
     y: float
     battery: float | None = None
@@ -121,6 +131,7 @@ class PlanZoneCreate(PlanEditorModel):
 
 class PlanAnchorCreate(PlanEditorModel):
     anchor_id: NonEmptyText
+    hardware_address: str | None = Field(default=None, max_length=32)
     x: float
     y: float
     z: float | None = None
@@ -157,6 +168,19 @@ class RangeMeasurement(BaseModel):
 class PositioningIngest(BaseModel):
     tag_id: str
     ranges: list[RangeMeasurement]
+
+
+class HardwareGatewayCreate(BaseModel):
+    device_id: NonEmptyText
+    plan_id: NonEmptyText
+    description: str = ""
+    enabled: bool = True
+
+
+class TagRegistration(BaseModel):
+    tag_id: NonEmptyText
+    plan_id: NonEmptyText
+    employee_id: str | None = None
 
 
 # ---------------------------------------------------------------------
@@ -241,6 +265,39 @@ def normalise_zone(payload: PlanZoneCreate) -> dict[str, Any]:
     return data
 
 
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _normal_hardware_address(value: Any) -> str:
+    return re.sub(r"[^0-9a-f]", "", str(value or ""), flags=re.IGNORECASE).upper()
+
+
+def _point_in_polygon(x: float, y: float, points: list[Any]) -> bool:
+    inside = False
+    previous = points[-1]
+    for current in points:
+        if not isinstance(current, (list, tuple)) or not isinstance(previous, (list, tuple)):
+            previous = current
+            continue
+        xi = _finite_number(current[0] if len(current) > 0 else None)
+        yi = _finite_number(current[1] if len(current) > 1 else None)
+        xj = _finite_number(previous[0] if len(previous) > 0 else None)
+        yj = _finite_number(previous[1] if len(previous) > 1 else None)
+        if None not in (xi, yi, xj, yj):
+            intersects = (yi > y) != (yj > y) and x < ((xj - xi) * (y - yi) / (yj - yi) + xi)
+            if intersects:
+                inside = not inside
+        previous = current
+    return inside
+
+
 def normalise_dimension(payload: PlanDimensionCreate) -> dict[str, Any]:
     data = payload.model_dump()
     dx = payload.x2 - payload.x1
@@ -266,8 +323,10 @@ def _query_params(province, project, plan, employee, customer, from_date, to_dat
 
 @app.on_event("startup")
 async def startup() -> None:
-    init_db()
-    seed_demo_data()
+    if settings.auto_migrate:
+        init_db()
+    if settings.seed_demo_data:
+        seed_demo_data()
     live_hub.start()
     if settings.simulator_enabled:
         simulator.start()
@@ -281,6 +340,19 @@ async def shutdown() -> None:
 
 @app.get("/health")
 def health():
+    try:
+        db.readiness()
+    except DatabaseError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "service": "supalai-tracking-api",
+                "database": "postgres",
+                "error": "PostgreSQL is reachable but the application schema is not accessible",
+                "time": utc_now().isoformat(),
+            },
+        )
     return {
         "ok": True,
         "service": "supalai-tracking-api",
@@ -421,15 +493,29 @@ def overview(
 
 
 @app.get("/api/devices")
-def devices(x_session: str | None = Header(default=None)):
+def devices(
+    x_session: str | None = Header(default=None),
+    project: str | None = None,
+    plan: str | None = None,
+):
     require_user(x_session)
-    return {"ok": True, "anchors": q.get_anchors(), "tags": q.get_tags()}
+    return {
+        "ok": True,
+        "anchors": q.get_anchors(project_id=project, plan_id=plan),
+        "tags": q.get_tags(project_id=project, plan_id=plan),
+    }
 
 
 @app.get("/api/live")
-def live(x_session: str | None = Header(default=None), since: float = 0, rows: int = 400):
+def live(
+    x_session: str | None = Header(default=None),
+    since: float = 0,
+    rows: int = 400,
+    project: str | None = None,
+    plan: str | None = None,
+):
     require_user(x_session)
-    return q.get_live_tags(rows=rows, since=since)
+    return q.get_live_tags(rows=rows, since=since, project_id=project, plan_id=plan)
 
 
 def websocket_session_token(websocket: WebSocket) -> str | None:
@@ -696,7 +782,12 @@ def plan_anchor_create(
 ):
     require_role(x_session, {"admin"})
     require_plan(plan_id)
-    anchor = q.create_plan_anchor(plan_id, payload.model_dump())
+    data = payload.model_dump()
+    data["hardware_address"] = _normal_hardware_address(data.get("hardware_address")) or None
+    try:
+        anchor = q.create_plan_anchor(plan_id, data)
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Anchor ID or hardware address is already in use") from exc
     if not anchor:
         raise HTTPException(status_code=404, detail="ไม่พบแปลน")
     return {"ok": True, "anchor": anchor}
@@ -737,6 +828,79 @@ def project_anchors(project_id: str, x_session: str | None = Header(default=None
     if not q.get_project(project_id):
         raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
     return {"ok": True, "anchors": q.get_anchors(project_id)}
+
+
+@app.get("/api/projects/{project_id}/hardware-gateways")
+def hardware_gateways(project_id: str, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    rows = db.fetchall(
+        """
+        SELECT device_id, project_id, plan_id, description, enabled,
+               last_seen, last_message_id, created_at, updated_at
+        FROM hardware_gateways
+        WHERE project_id = %s
+        ORDER BY device_id
+        """,
+        (project_id,),
+    )
+    now = utc_now()
+    for row in rows:
+        row["on"] = bool(row["last_seen"] and (now - row["last_seen"]).total_seconds() <= 10)
+    return {"ok": True, "gateways": rows}
+
+
+@app.post("/api/projects/{project_id}/hardware-gateways")
+def hardware_gateway_create(
+    project_id: str,
+    payload: HardwareGatewayCreate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    plan = require_plan(payload.plan_id)
+    if plan["project_id"] != project_id:
+        raise HTTPException(status_code=422, detail="Plan does not belong to this project")
+    gateway = db.execute_returning(
+        """
+        INSERT INTO hardware_gateways (device_id, project_id, plan_id, description, enabled)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (device_id) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            plan_id = EXCLUDED.plan_id,
+            description = EXCLUDED.description,
+            enabled = EXCLUDED.enabled,
+            updated_at = now()
+        RETURNING device_id, project_id, plan_id, description, enabled,
+                  last_seen, last_message_id, created_at, updated_at
+        """,
+        (payload.device_id, project_id, payload.plan_id, payload.description, payload.enabled),
+    )
+    return {"ok": True, "gateway": gateway}
+
+
+@app.post("/api/projects/{project_id}/tags")
+def project_tag_create(
+    project_id: str,
+    payload: TagRegistration,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    plan = require_plan(payload.plan_id)
+    if plan["project_id"] != project_id:
+        raise HTTPException(status_code=422, detail="Plan does not belong to this project")
+    tag = db.execute_returning(
+        """
+        INSERT INTO tags (tag_id, employee_id, project_id, plan_id)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (tag_id) DO UPDATE SET
+            employee_id = COALESCE(EXCLUDED.employee_id, tags.employee_id),
+            project_id = EXCLUDED.project_id,
+            plan_id = EXCLUDED.plan_id
+        RETURNING tag_id, employee_id, project_id, plan_id, x, y, z,
+                  battery, last_ts, source, device_id
+        """,
+        (payload.tag_id, payload.employee_id, project_id, payload.plan_id),
+    )
+    return {"ok": True, "tag": tag}
 
 
 # ---------------------------------------------------------------------
@@ -786,6 +950,170 @@ def calculate_coverage(payload: dict[str, Any], x_session: str | None = Header(d
 # ---------------------------------------------------------------------
 # Positioning — real multilateration
 # ---------------------------------------------------------------------
+
+@app.post("/api/hardware/ingest")
+async def hardware_ingest(request: Request):
+    """Authenticate an on-site UWB gateway and persist one idempotent fix."""
+    secret = settings.hardware_ingest_secret
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="Hardware ingestion is not configured")
+
+    raw_body = await request.body()
+    device_id = request.headers.get("x-uwb-device-id", "").strip()
+    timestamp_text = request.headers.get("x-uwb-timestamp", "")
+    signature = request.headers.get("x-uwb-signature", "")
+    if not device_id or not re.fullmatch(r"\d{10}", timestamp_text) or not re.fullmatch(r"[0-9a-fA-F]{64}", signature):
+        raise HTTPException(status_code=401, detail="Invalid or expired hardware signature")
+    timestamp = int(timestamp_text)
+    if abs(time.time() - timestamp) > 120:
+        raise HTTPException(status_code=401, detail="Invalid or expired hardware signature")
+    signed = device_id.encode() + b"." + timestamp_text.encode() + b"." + raw_body
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature.lower()):
+        raise HTTPException(status_code=401, detail="Invalid or expired hardware signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    message_id = str(payload.get("message_id") or "").strip()
+    tag_id = str(payload.get("tag_id") or "").strip()
+    if not message_id or len(message_id) > 160 or not tag_id or len(tag_id) > 100:
+        raise HTTPException(status_code=400, detail="message_id and tag_id are required")
+
+    gateway = db.fetchone(
+        """
+        SELECT gateway.device_id, gateway.project_id, gateway.plan_id, gateway.enabled,
+               plan.width_m, plan.height_m
+        FROM hardware_gateways AS gateway
+        JOIN plans AS plan ON plan.id = gateway.plan_id
+        WHERE gateway.device_id = %s
+        """,
+        (device_id,),
+    )
+    if not gateway or not gateway["enabled"]:
+        raise HTTPException(status_code=403, detail="Gateway is not registered or is disabled")
+
+    registered_tag = db.fetchone(
+        "SELECT tag_id, project_id FROM tags WHERE tag_id = %s",
+        (tag_id,),
+    )
+    if not registered_tag:
+        raise HTTPException(status_code=404, detail="Tag is not registered")
+    if registered_tag["project_id"] and registered_tag["project_id"] != gateway["project_id"]:
+        raise HTTPException(status_code=422, detail="Tag belongs to a different project")
+
+    measured_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    if payload.get("measured_at"):
+        try:
+            measured_at = datetime.fromisoformat(str(payload["measured_at"]).replace("Z", "+00:00"))
+            if measured_at.tzinfo is None:
+                measured_at = measured_at.replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="measured_at is invalid") from exc
+    if abs((utc_now() - measured_at).total_seconds()) > 300:
+        raise HTTPException(status_code=400, detail="measured_at is invalid or too old")
+
+    fix_x: float | None = None
+    fix_y: float | None = None
+    fix_z: float | None = None
+    residual_m: float | None = None
+    anchors_used: int | None = None
+    source = "hardware_position"
+    anchor_status: list[dict[str, Any]] = []
+
+    position = payload.get("position")
+    if isinstance(position, dict):
+        fix_x = _finite_number(position.get("x"))
+        fix_y = _finite_number(position.get("y"))
+        fix_z = _finite_number(position.get("z"))
+        residual_m = _finite_number(position.get("residual_m"))
+        used = _finite_number(position.get("anchors_used"))
+        anchors_used = int(used) if used is not None else None
+        if fix_x is None or fix_y is None:
+            raise HTTPException(status_code=400, detail="position.x and position.y must be numbers in metres")
+    else:
+        anchors = q.get_anchors(gateway["project_id"], gateway["plan_id"])
+        anchor_map: dict[str, dict[str, Any]] = {}
+        for anchor in anchors:
+            anchor_map[_normal_hardware_address(anchor["anchor_id"])] = anchor
+            if anchor.get("hardware_address"):
+                anchor_map[_normal_hardware_address(anchor["hardware_address"])] = anchor
+        known: dict[str, tuple[dict[str, Any], float]] = {}
+        ranges = payload.get("ranges") if isinstance(payload.get("ranges"), list) else []
+        for item in ranges:
+            if not isinstance(item, dict):
+                continue
+            anchor = anchor_map.get(_normal_hardware_address(item.get("anchor_id")))
+            distance = _finite_number(item.get("distance_m"))
+            if anchor and distance is not None and 0 < distance <= 1000:
+                known[anchor["anchor_id"]] = (anchor, distance)
+        if len(known) < 3:
+            raise HTTPException(status_code=400, detail=f"At least 3 mapped anchors are required; received {len(known)}")
+        ordered = list(known.values())
+        calculated = positioning.trilaterate(
+            [(item[0]["x"], item[0]["y"]) for item in ordered],
+            [item[1] for item in ordered],
+        )
+        if calculated is None:
+            raise HTTPException(status_code=422, detail="Anchor geometry cannot produce a position")
+        fix_x, fix_y = calculated.x, calculated.y
+        residual_m, anchors_used = calculated.residual_m, calculated.anchors_used
+        source = "uwb_ranges"
+        reported_status = payload.get("anchor_status") if isinstance(payload.get("anchor_status"), list) else []
+        battery_by_address = {
+            _normal_hardware_address(item.get("anchor_id")): _finite_number(item.get("battery"))
+            for item in reported_status if isinstance(item, dict)
+        }
+        anchor_status = [
+            {
+                "anchor_id": anchor["anchor_id"],
+                "battery": battery_by_address.get(_normal_hardware_address(anchor.get("hardware_address") or anchor["anchor_id"])),
+            }
+            for anchor, _distance in ordered
+        ]
+
+    assert fix_x is not None and fix_y is not None
+    if fix_x < -2 or fix_x > gateway["width_m"] + 2 or fix_y < -2 or fix_y > gateway["height_m"] + 2:
+        raise HTTPException(status_code=422, detail="Calculated position is outside the plan boundary")
+    if residual_m is not None and residual_m > 3:
+        raise HTTPException(status_code=422, detail=f"Position rejected: residual {residual_m:.3f} m is too high")
+
+    zones = db.fetchall(
+        """
+        SELECT name, geometry, x_min, x_max, y_min, y_max
+        FROM zones WHERE project_id = %s AND plan_id = %s ORDER BY id
+        """,
+        (gateway["project_id"], gateway["plan_id"]),
+    )
+    zone = None
+    for candidate in zones:
+        points = (candidate.get("geometry") or {}).get("points")
+        inside = _point_in_polygon(fix_x, fix_y, points) if isinstance(points, list) and len(points) >= 3 else (
+            candidate["x_min"] <= fix_x <= candidate["x_max"]
+            and candidate["y_min"] <= fix_y <= candidate["y_max"]
+        )
+        if inside:
+            zone = candidate["name"]
+            break
+
+    row = db.fetchone(
+        """
+        SELECT ingest_hardware_fix(
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+        ) AS result
+        """,
+        (
+            device_id, message_id, tag_id, measured_at, fix_x, fix_y, fix_z,
+            zone, source, residual_m, anchors_used, _finite_number(payload.get("tag_battery")),
+            Json(anchor_status),
+        ),
+    )
+    return row["result"] if row else {"ok": False}
+
 
 @app.get("/api/positioning/{project_id}")
 def positioning_snapshot(project_id: str, x_session: str | None = Header(default=None)):
@@ -872,6 +1200,14 @@ def frontend_dashboard():
 @app.get("/plan-editor.html", include_in_schema=False)
 def frontend_plan_editor():
     file = FRONTEND_DIR / "plan-editor.html"
+    if file.exists():
+        return FileResponse(file)
+    raise HTTPException(status_code=404)
+
+
+@app.get("/logo.jpg", include_in_schema=False)
+def frontend_logo():
+    file = FRONTEND_DIR / "logo.jpg"
     if file.exists():
         return FileResponse(file)
     raise HTTPException(status_code=404)

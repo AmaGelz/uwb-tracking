@@ -1,12 +1,15 @@
-# Tag firmware — not yet implemented
+# Tag firmware
 
-This folder is a placeholder — same situation as `hardware/anchor/`.
-A UWB tag worn by a sales rep needs to range against nearby anchors and
-report those distances somewhere the backend can read them; the exact
-firmware depends on the chip/board chosen, which this project doesn't
-currently specify.
+Production firmware for the Makerfabs ESP32 UWB / DW1000 tag is in
+`supalai_tag/supalai_tag.ino`. It collects fresh ranges from at least three
+anchors and sends an HMAC-signed frame to FastAPI's
+`POST /api/hardware/ingest` endpoint every 250 ms.
 
-Until real hardware exists, `backend/backend/simulator.py` moves the
-seeded demo tags around the floor plan so the app has live data to
-show. See `backend/README.md` → "Connecting real UWB hardware" for how
-a real tag would plug in via `POST /api/positioning/{project_id}/ingest`.
+Use HTTPS for deployed hardware. Plain HTTP is available only for testing on
+a trusted local network where the ESP32 connects directly to the developer's
+FastAPI server.
+
+Copy `secrets.example.h` to the Git-ignored `secrets.h`, or run
+`scripts/configure-hardware-secret.ps1`. Never put `DATABASE_URL` or a
+PostgreSQL password on the ESP32. See `hardware/PRODUCTION_SETUP.md` for the
+complete setup.

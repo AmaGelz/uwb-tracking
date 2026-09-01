@@ -1,7 +1,7 @@
 # SUPALAI-UWB Backend
 
-FastAPI backend for the SUPALAI Tracking dashboard. Talks directly to
-Postgres (a Supabase project, or any Postgres) — no SQLite involved.
+FastAPI backend for the SUPALAI Tracking dashboard. It is the only component
+that talks directly to PostgreSQL; browser and firmware clients use its API.
 
 ## 1. Install
 
@@ -14,21 +14,21 @@ pip install -r requirements.txt
 
 ## 2. Point it at a database
 
-You need a **Postgres connection string**, not just the Supabase
-project's URL/anon key (those are for the REST/PostgREST API — see
-`supabase_main.py` for that path — and can't open a raw SQL connection
-on their own).
-
-Get it from **Supabase dashboard → Project Settings → Database →
-Connection string → URI**. Use the "Transaction pooler" URI (port
-`6543`) — it plays nicely with the connection pool this backend keeps
-open.
+You need a PostgreSQL connection string for a database/user owned by this
+application. The user must be able to create and alter the application tables
+when startup migrations run.
 
 Put it in `backend/.env`:
 
 ```env
-DATABASE_URL=postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-REGION.pooler.supabase.com:6543/postgres
+DATABASE_URL=postgresql://supalai_app:[PASSWORD]@db.example.com:5432/supalai
 ```
+
+Use the same host, port, database, user, and password when creating the
+PostgreSQL connection in DBeaver. See
+[`database/DBEAVER_SETUP.md`](../database/DBEAVER_SETUP.md) for the exact
+field mapping and migration workflow. DBeaver does not need to be running for
+the API to work.
 
 Then create the schema (and load demo data):
 
@@ -41,11 +41,34 @@ python migration/migration.py --seed
 pulling schema changes. See `--help` for options, including
 `--from-sqlite` if you have a prior SQLite deployment to bring over.
 
-**No Supabase project yet / just want to try it locally?** Leave
-`DATABASE_URL` empty in `backend/.env`. The backend falls back to
+For local development, leave `DATABASE_URL` empty in `backend/.env`. The backend falls back to
 `postgresql://postgres:postgres@127.0.0.1:5432/supalai_test` and will
 create its own schema + seed data on first boot, as long as a local
 Postgres is reachable there.
+
+Set `SEED_DEMO_DATA=false` and `SIMULATOR_ENABLED=false` for a production
+database so startup does not add demo accounts/visits or simulated positions.
+When the production runtime role has data-only permissions, also set
+`AUTO_MIGRATE=false` and have the database owner run `migration/migration.py`
+as a separate deployment step. This prevents FastAPI startup from attempting
+DDL with the restricted runtime role.
+
+If the tables are owned by a DBA/migration role rather than the username in
+`DATABASE_URL`, the owner must also edit the role name and run
+[`database/configure_backend_role.sql`](../database/configure_backend_role.sql)
+once. It grants only application-table access, sequence use, function
+execution, and an RLS policy for that backend role; it does not grant schema
+creation or table ownership.
+
+Verify both connectivity and application-table permissions before starting:
+
+```powershell
+backend/.venv/Scripts/python.exe backend/check_database.py
+```
+
+The final line must be `app_schema_access=ok`. A successful TCP/login test by
+itself is insufficient because PostgreSQL can accept a connection while
+rejecting every application query.
 
 ## 3. Start the server
 
@@ -60,8 +83,22 @@ or
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+For Azure App Service, deploy from the repository root and configure this
+Startup Command:
+
+```text
+gunicorn --chdir backend/backend --bind=0.0.0.0 --timeout 600 --workers 2 --worker-class uvicorn.workers.UvicornWorker main:app
+```
+
+This is the only production ASGI application. UWB sources must send the
+authenticated `/api/hardware/ingest` contract. If a device cannot produce that
+format or HMAC signature itself, translate and sign its frames in a small edge
+adapter; `backend.legacy_tag_bridge` is the working adapter for the existing
+Makerfabs TCP format.
+
 On startup it applies `database/schema.sql`, loads
-`database/seed.sql`, and — unless `SIMULATOR_ENABLED=false` — starts a
+`database/seed.sql` when `SEED_DEMO_DATA=true`, and — unless
+`SIMULATOR_ENABLED=false` — starts a
 background task that moves the demo tags around the seeded floor plan
 so the live map, visit history, and analytics all have real (if
 synthetic) data without any physical UWB hardware attached.
@@ -97,31 +134,50 @@ Restart the server after changing it. Google Sign-In only logs in an
 
 Once real anchors/tags exist:
 
-1. Set `SIMULATOR_ENABLED=false` in `backend/.env`.
-2. Register the project's anchors via `POST /api/projects/{id}/anchors`
-   (or directly in the `anchors` table) with their real (x, y) survey
-   positions.
-3. Have your anchor gateway / tag firmware POST ranging results to
-   `POST /api/positioning/{project_id}/ingest`:
+1. Set `SEED_DEMO_DATA=false`, `SIMULATOR_ENABLED=false`, and a long random
+   `HARDWARE_INGEST_SECRET` in `backend/.env`.
+2. In the plan editor, register surveyed anchors with their real `(x, y)` and
+   `hardware_address`, then register the gateway and tag on that plan.
+3. Have the gateway send HMAC-signed ranging results to
+   `POST /api/hardware/ingest`:
 
    ```json
    {
+     "message_id": "SUPALAI-TAG-GW-01-boot-1",
      "tag_id": "TAG01",
      "ranges": [
-       {"anchor_id": "A01", "distance_m": 9.85},
-       {"anchor_id": "A02", "distance_m": 9.85},
-       {"anchor_id": "A03", "distance_m": 12.73},
-       {"anchor_id": "A04", "distance_m": 12.73}
+       {"anchor_id": "1782", "distance_m": 9.85},
+       {"anchor_id": "1783", "distance_m": 9.85},
+       {"anchor_id": "1784", "distance_m": 12.73}
      ]
    }
    ```
 
-   (needs distances from at least 3 known anchors). The backend solves
-   the position via least-squares multilateration (`positioning.py`),
-   figures out which zone it landed in, records it, and keeps the
-   visit lifecycle in sync — the exact same code path
-   (`tracking.ingest_fix`) the simulator uses, so this is a drop-in
-   replacement rather than a second implementation to maintain.
+   The headers and signature format are implemented by the included firmware.
+   See `hardware/PRODUCTION_SETUP.md`. The endpoint rejects stale/bad
+   signatures and high-residual fixes, maps zones, and commits positions,
+   device state, visits, and idempotency receipts in PostgreSQL.
+
+### Keep the firmware already installed on a Makerfabs tag
+
+The current board can also be used without reflashing. Its existing firmware
+listens on TCP port `8888` and emits Makerfabs frames such as:
+
+```json
+{"tag_id":"tag0","links":[{"A":"1782","R":"2.34"}]}
+```
+
+Connect the computer to the same `192.168.1.x` network as the tag, start
+FastAPI, and run the adapter from the `backend` directory:
+
+```powershell
+& .\.venv\Scripts\python.exe -m backend.legacy_tag_bridge
+```
+
+The defaults map board tag `tag0` to registered tag `TAG01`, use gateway
+`SUPALAI-TAG-GW-01`, connect to `192.168.1.200:8888`, and post locally to
+FastAPI. Override them with `UWB_LEGACY_*` settings shown in `.env.example`
+or with `python -m backend.legacy_tag_bridge --help`.
 
 ## What's implemented
 

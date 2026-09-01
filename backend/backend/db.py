@@ -13,14 +13,14 @@ from config import settings
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCHEMA_SQL = REPO_ROOT / "database" / "schema.sql"
 SEED_SQL = REPO_ROOT / "database" / "seed.sql"
+MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 
 
 class Database:
     """Thin Postgres access layer.
 
-    Talks to Supabase's Postgres (or any Postgres) directly over the
-    wire via psycopg2 rather than through the PostgREST/supabase-py
-    client, because several endpoints here (analytics, dwell-time,
+    Talks to PostgreSQL directly over the wire via psycopg2. Several
+    endpoints here (analytics, dwell-time,
     visit funnels) need real joins/aggregations that are awkward to
     express through a REST-table client. A small connection pool
     keeps this fast against a hosted database where every new TCP+TLS
@@ -80,13 +80,25 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute(sql_text)
 
+    def readiness(self) -> None:
+        """Verify that the configured role can use the application schema."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # SELECT 1 alone only proves that PostgreSQL is reachable.  A
+                # runtime role can connect successfully while having no table
+                # privileges, so exercise a real application table as well.
+                cur.execute("SELECT 1 FROM users LIMIT 1")
+
 
 db = Database(settings.database_url)
 
 
 def init_db() -> None:
-    """Apply database/schema.sql. Idempotent (CREATE TABLE IF NOT EXISTS)."""
+    """Apply the base schema and ordered, idempotent PostgreSQL migrations."""
     db.script(SCHEMA_SQL.read_text(encoding="utf-8"))
+    if MIGRATIONS_DIR.exists():
+        for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            db.script(migration.read_text(encoding="utf-8"))
 
 
 def seed_demo_data() -> None:
@@ -95,3 +107,7 @@ def seed_demo_data() -> None:
     if not text:
         return
     db.script(text)
+    # Re-run idempotent migrations so backfills also cover newly seeded rows.
+    if MIGRATIONS_DIR.exists():
+        for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            db.script(migration.read_text(encoding="utf-8"))

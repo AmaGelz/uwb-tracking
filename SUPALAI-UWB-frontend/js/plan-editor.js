@@ -51,6 +51,7 @@
     anchorSettings: document.getElementById('anchor-settings'),
     anchorSettingsTitle: document.getElementById('anchor-settings-title'),
     anchorIdInput: document.getElementById('anchor-id-input'),
+    anchorHardwareInput: document.getElementById('anchor-hardware-input'),
     anchorZInput: document.getElementById('anchor-z-input'),
     anchorMountInput: document.getElementById('anchor-mount-input'),
     saveAnchorProperties: document.getElementById('save-anchor-properties'),
@@ -58,6 +59,15 @@
     lineLengthInput: document.getElementById('line-length-input'),
     lineAngleInput: document.getElementById('line-angle-input'),
     saveLineProperties: document.getElementById('save-line-properties'),
+    precisionForm: document.getElementById('precision-input'),
+    precisionTitle: document.getElementById('precision-title'),
+    precisionLength: document.getElementById('precision-length'),
+    precisionAngle: document.getElementById('precision-angle'),
+    precisionApply: document.getElementById('precision-apply'),
+    hardwareSettings: document.getElementById('hardware-settings'),
+    gatewayDeviceInput: document.getElementById('gateway-device-input'),
+    hardwareTagInput: document.getElementById('hardware-tag-input'),
+    registerHardware: document.getElementById('register-hardware'),
     counts: document.getElementById('entity-counts'),
     gridSize: document.getElementById('grid-size'),
     roleHint: document.getElementById('editor-role-hint'),
@@ -82,6 +92,7 @@
     spaceDown: false,
     gridVisible: true,
     snapEnabled: true,
+    labelsVisible: true,
     gridStep: 1,
     isAdmin: false,
     editMode: false,
@@ -185,6 +196,62 @@
     };
   }
 
+  function activeSegment() {
+    if (state.draft?.kind === 'zone' && state.draft.points?.length) {
+      return {
+        kind: 'zone',
+        start: state.draft.points[state.draft.points.length - 1],
+        end: state.draft.cursor,
+      };
+    }
+    if (['line', 'dimension'].includes(state.draft?.kind) && state.draft.start) {
+      return { kind: state.draft.kind, start: state.draft.start, end: state.draft.end };
+    }
+    return null;
+  }
+
+  function compactNumber(value, digits = 4) {
+    return Number(value).toFixed(digits).replace(/\.?0+$/, '');
+  }
+
+  function syncPrecisionInput(force = false) {
+    const segment = activeSegment();
+    ui.precisionForm.hidden = !segment;
+    if (!segment) return;
+
+    const names = { line: 'Line segment', zone: 'Zone edge', dimension: 'Dimension' };
+    const actions = { line: 'Add line', zone: 'Add edge', dimension: 'Set' };
+    ui.precisionTitle.textContent = names[segment.kind];
+    ui.precisionApply.textContent = actions[segment.kind];
+    if (!segment.end || (!force && ui.precisionForm.contains(document.activeElement))) return;
+    const { length, angle } = measurement(segment.start, segment.end);
+    ui.precisionLength.value = compactNumber(length);
+    ui.precisionAngle.value = compactNumber(angle);
+  }
+
+  function focusPrecisionLength() {
+    requestAnimationFrame(() => {
+      if (ui.precisionForm.hidden) return;
+      ui.precisionLength.focus({ preventScroll: true });
+      ui.precisionLength.select();
+    });
+  }
+
+  function previewPrecisionInput() {
+    const segment = activeSegment();
+    const length = Number(ui.precisionLength.value);
+    const angle = Number(ui.precisionAngle.value);
+    if (!segment || !Number.isFinite(length) || length <= 0 || !Number.isFinite(angle)) return;
+    const radians = angle * Math.PI / 180;
+    const end = {
+      x: segment.start.x + length * Math.cos(radians),
+      y: segment.start.y + length * Math.sin(radians),
+    };
+    if (segment.kind === 'zone') state.draft.cursor = end;
+    else state.draft.end = end;
+    renderDraft();
+  }
+
   function linePoints(object) {
     if (!object) return [];
     const type = String(object.geometry?.type || object.object_type || '').toLowerCase();
@@ -221,7 +288,7 @@
   }
 
   function addLabel(group, text, x, y, anchor = 'start') {
-    if (!text) return;
+    if (!text || !state.labelsVisible) return;
     const scale = visualScale();
     const label = svgElement('text', {
       class: 'entity-label',
@@ -297,7 +364,9 @@
 
       if (!shape) return;
       group.appendChild(shape);
-      addLabel(group, object.label || object.object_type, labelX, labelY, 'middle');
+      // Unnamed construction lines should stay visually quiet. Showing the
+      // object type on every segment quickly covers an irregular floor plan.
+      addLabel(group, object.label, labelX, labelY, 'middle');
       ui.objectLayer.appendChild(group);
     });
   }
@@ -363,9 +432,12 @@
         class: 'editor-shape zone-shape',
         points: pointString(points),
       }));
-      const x = Math.min(...points.map(point => point.x)) + scale.offset;
-      const y = svgY(Math.max(...points.map(point => point.y))) + scale.label + scale.offset;
-      addLabel(group, zone.name, x, y);
+      const x = points.reduce((sum, point) => sum + point.x, 0) / points.length;
+      const y = svgY(points.reduce((sum, point) => sum + point.y, 0) / points.length);
+      group.appendChild(svgElement('circle', {
+        class: 'entity-label-dot', cx: x, cy: y, r: scale.handle * 0.55,
+      }));
+      addLabel(group, zone.name, x + scale.offset * 0.75, y - scale.offset * 0.45);
       ui.zoneLayer.appendChild(group);
     });
   }
@@ -376,11 +448,16 @@
     state.anchors.forEach(anchor => {
       const x = Number(anchor.x);
       const y = svgY(Number(anchor.y));
-      const size = scale.anchor;
+      const size = scale.anchor * 0.55;
       const group = entityGroup('anchor', anchor.anchor_id);
-      group.appendChild(svgElement('path', {
+      group.appendChild(svgElement('circle', {
+        class: 'anchor-hit', cx: x, cy: y, r: scale.anchor * 1.45,
+      }));
+      group.appendChild(svgElement('circle', {
         class: 'editor-shape anchor-shape',
-        d: `M ${x} ${y - size} L ${x + size} ${y} L ${x} ${y + size} L ${x - size} ${y} Z`,
+        cx: x,
+        cy: y,
+        r: size,
       }));
       addLabel(group, anchor.anchor_id, x + size + scale.offset * 0.5, y - size);
       ui.anchorLayer.appendChild(group);
@@ -424,7 +501,10 @@
 
   function renderDraft() {
     clearLayer(ui.draftLayer);
-    if (!state.draft) return;
+    if (!state.draft) {
+      syncPrecisionInput();
+      return;
+    }
     const draft = state.draft;
     const scale = visualScale();
 
@@ -442,10 +522,14 @@
           class: 'draft-handle', cx: point.x, cy: svgY(point.y), r: scale.handle,
         }));
       });
+      syncPrecisionInput();
       return;
     }
 
-    if (!draft.start || !draft.end) return;
+    if (!draft.start || !draft.end) {
+      syncPrecisionInput();
+      return;
+    }
     const x = Math.min(draft.start.x, draft.end.x);
     const y = Math.min(draft.start.y, draft.end.y);
     const width = Math.abs(draft.end.x - draft.start.x);
@@ -473,6 +557,7 @@
         );
       }
     }
+    syncPrecisionInput();
   }
 
   function renderScene() {
@@ -584,6 +669,7 @@
     if (kind === 'anchor') {
       return {
         ID: entity.anchor_id,
+        Hardware: entity.hardware_address || '—',
         X: `${Number(entity.x).toFixed(3)} m`,
         Y: `${Number(entity.y).toFixed(3)} m`,
         Z: entity.z == null ? '—' : `${Number(entity.z).toFixed(3)} m`,
@@ -686,13 +772,19 @@
     ui.planHeightInput.disabled = !formEditable;
     ui.planVersionInput.disabled = !formEditable;
     ui.planActiveInput.disabled = !formEditable;
+    const canRegisterHardware = Boolean(state.isAdmin && state.plan?.plan_id && !state.isNewPlan);
+    ui.gatewayDeviceInput.disabled = !canRegisterHardware;
+    ui.hardwareTagInput.disabled = !canRegisterHardware;
+    ui.registerHardware.disabled = !canRegisterHardware;
 
     document.querySelectorAll('[data-tool]').forEach(button => {
       if (EDIT_TOOLS.has(button.dataset.tool)) button.disabled = !state.canEdit;
     });
     document.getElementById('tool-delete').disabled = !state.canEdit;
 
-    if (!state.canEdit && EDIT_TOOLS.has(state.tool)) setTool('select');
+    // A short API save makes canEdit false while state.busy is true. Keep the
+    // current drawing command alive so polyline entry can continue afterwards.
+    if (!state.canEdit && !state.busy && EDIT_TOOLS.has(state.tool)) setTool('select');
     if (!state.isAdmin) {
       ui.roleHint.textContent = `Read only · role ${session.user?.role || '-'} ไม่มีสิทธิ์แก้ไขแปลน`;
     } else if (state.isNewPlan) {
@@ -718,6 +810,7 @@
 
     if (!ui.anchorSettings.contains(document.activeElement)) {
       ui.anchorIdInput.value = selectedAnchor?.anchor_id || '';
+      ui.anchorHardwareInput.value = selectedAnchor?.hardware_address || '';
       ui.anchorZInput.value = selectedAnchor?.z == null ? '' : String(selectedAnchor.z);
       ui.anchorMountInput.value = selectedAnchor?.mount_height_m == null
         ? '' : String(selectedAnchor.mount_height_m);
@@ -760,9 +853,9 @@
     ui.svg.dataset.tool = tool;
     const help = {
       select: 'Select: คลิกวัตถุเพื่อเลือก · ลาก object เพื่อย้าย',
-      line: 'Line: ลากจากจุดเริ่มไปจุดปลาย',
+      line: 'Line: click a start point, then click an end point or enter exact Length / Angle · Esc to finish',
       rectangle: 'Rectangle: ลากมุมตรงข้ามสองมุม',
-      zone: 'Zone: คลิกอย่างน้อย 3 จุด แล้ว double click เพื่อจบ polygon',
+      zone: 'Zone: click points or enter exact edge lengths · click the first point / double-click to close',
       anchor: 'Anchor: ตั้งค่า ID / Z / Mount height แล้วคลิกตำแหน่งติดตั้ง',
       dimension: 'Dimension: คลิกจุดเริ่ม แล้วคลิกจุดปลาย',
     };
@@ -789,6 +882,7 @@
 
   async function createObject(kind, start, end) {
     let geometry;
+    let properties = {};
     if (kind === 'rectangle') {
       geometry = {
         type: 'rectangle',
@@ -799,17 +893,23 @@
       };
     } else {
       geometry = geometryFromPoints('line', [start, end]);
+      const { length, angle } = measurement(start, end);
+      properties = { length_m: length, angle_deg: angle };
     }
     const response = await safeMutation(
       () => api(`/api/plans/${encodeURIComponent(state.plan.plan_id)}/objects`, {
         method: 'POST',
-        body: JSON.stringify({ object_type: kind, geometry, properties: {} }),
+        body: JSON.stringify({ object_type: kind, geometry, properties }),
       }),
       `${kind} บันทึกแล้ว`,
     );
     if (response?.object) {
       state.objects.push(response.object);
+      if (kind === 'line' && state.tool === 'line') {
+        state.draft = { kind: 'line', start: end, end };
+      }
       selectEntity('object', response.object.object_id);
+      if (kind === 'line' && state.tool === 'line') focusPrecisionLength();
     }
   }
 
@@ -916,10 +1016,12 @@
 
   async function createAnchor(point) {
     let anchorId;
+    let hardwareAddress;
     let z;
     let mountHeight;
     try {
       anchorId = ui.anchorIdInput.value.trim() || nextAnchorId();
+      hardwareAddress = ui.anchorHardwareInput.value.trim() || null;
       z = optionalMetres(ui.anchorZInput, 'Z');
       mountHeight = optionalMetres(ui.anchorMountInput, 'Mount height', 0);
     } catch (error) {
@@ -935,6 +1037,7 @@
         method: 'POST',
         body: JSON.stringify({
           anchor_id: anchorId,
+          hardware_address: hardwareAddress,
           x: point.x,
           y: point.y,
           z,
@@ -946,6 +1049,7 @@
     if (response?.anchor) {
       state.anchors.push(response.anchor);
       ui.anchorIdInput.value = '';
+      ui.anchorHardwareInput.value = '';
       selectEntity('anchor', response.anchor.anchor_id);
     }
   }
@@ -955,6 +1059,7 @@
     if (!anchor || state.selected?.kind !== 'anchor') return;
     let z;
     let mountHeight;
+    const hardwareAddress = ui.anchorHardwareInput.value.trim() || null;
     try {
       z = optionalMetres(ui.anchorZInput, 'Z');
       mountHeight = optionalMetres(ui.anchorMountInput, 'Mount height', 0);
@@ -967,6 +1072,7 @@
         method: 'POST',
         body: JSON.stringify({
           anchor_id: anchor.anchor_id,
+          hardware_address: hardwareAddress,
           x: Number(anchor.x),
           y: Number(anchor.y),
           z,
@@ -980,6 +1086,29 @@
       Object.assign(anchor, response.anchor);
       renderScene();
     }
+  }
+
+  async function registerHardware() {
+    if (!state.isAdmin || !state.plan?.plan_id || state.isNewPlan) return;
+    const deviceId = ui.gatewayDeviceInput.value.trim();
+    const tagId = ui.hardwareTagInput.value.trim();
+    if (!deviceId || !tagId) {
+      setMessage('กรุณาระบุ Gateway device ID และ Tag ID', 'error');
+      return;
+    }
+    const projectId = state.plan.project_id;
+    const planId = state.plan.plan_id;
+    const result = await safeMutation(async () => {
+      await api(`/api/projects/${encodeURIComponent(projectId)}/hardware-gateways`, {
+        method: 'POST',
+        body: JSON.stringify({ device_id: deviceId, plan_id: planId, enabled: true }),
+      });
+      return api(`/api/projects/${encodeURIComponent(projectId)}/tags`, {
+        method: 'POST',
+        body: JSON.stringify({ tag_id: tagId, plan_id: planId }),
+      });
+    }, `เชื่อม ${deviceId} / ${tagId} กับแปลนแล้ว`);
+    if (result?.tag) setMessage(`พร้อมรับข้อมูลจาก ${deviceId} สำหรับ ${tagId}`, 'success');
   }
 
   async function createDimension(start, end) {
@@ -1001,6 +1130,53 @@
     if (response?.dimension) {
       state.dimensions.push(response.dimension);
       selectEntity('dimension', response.dimension.dimension_id);
+    }
+  }
+
+  async function applyPrecisionInput() {
+    const segment = activeSegment();
+    if (!segment || !state.canEdit || state.busy) return;
+
+    const length = Number(ui.precisionLength.value);
+    const angle = Number(ui.precisionAngle.value);
+    if (!Number.isFinite(length) || length <= 0) {
+      setMessage('Length must be greater than 0 metres', 'error');
+      ui.precisionLength.focus();
+      return;
+    }
+    if (!Number.isFinite(angle)) {
+      setMessage('Angle must be a number in degrees', 'error');
+      ui.precisionAngle.focus();
+      return;
+    }
+
+    const radians = angle * Math.PI / 180;
+    const end = {
+      x: segment.start.x + length * Math.cos(radians),
+      y: segment.start.y + length * Math.sin(radians),
+    };
+
+    if (segment.kind === 'zone') {
+      const points = state.draft.points;
+      const closeTolerance = metresPerPixel() * 12;
+      if (points.length >= 3 && distance(end, points[0]) <= closeTolerance) {
+        finishZone();
+        return;
+      }
+      points.push(end);
+      state.draft.cursor = end;
+      renderDraft();
+      setMessage(`Zone edge ${length.toFixed(3)} m at ${angle.toFixed(2)}° added`);
+      focusPrecisionLength();
+      return;
+    }
+
+    state.draft = null;
+    renderDraft();
+    if (segment.kind === 'dimension') {
+      await createDimension(segment.start, end);
+    } else {
+      await createObject('line', segment.start, end);
     }
   }
 
@@ -1200,6 +1376,7 @@
         points.push(point);
         state.draft = { kind: 'zone', points, cursor: point };
         renderDraft();
+        if (points.length === 1) focusPrecisionLength();
       }
       return;
     }
@@ -1208,6 +1385,7 @@
         state.draft = { kind: 'dimension', start: point, end: point };
         setMessage(`Dimension start: X ${point.x.toFixed(2)} · Y ${point.y.toFixed(2)} m — คลิกจุดปลาย`);
         renderDraft();
+        focusPrecisionLength();
         return;
       }
       const start = state.draft.start;
@@ -1222,8 +1400,26 @@
       void createDimension(start, point);
       return;
     }
-    if (state.tool === 'line' || state.tool === 'rectangle') {
-      state.draft = { kind: state.tool, start: point, end: point };
+    if (state.tool === 'line') {
+      if (state.draft?.kind !== 'line' || !state.draft.start) {
+        state.draft = { kind: 'line', start: point, end: point };
+        renderDraft();
+        setMessage(`Line start: X ${point.x.toFixed(2)} · Y ${point.y.toFixed(2)} m — click an end or type exact values`);
+        focusPrecisionLength();
+        return;
+      }
+      const start = state.draft.start;
+      if (distance(start, point) <= 1e-9) {
+        setMessage('The line end must be different from its start', 'error');
+        return;
+      }
+      state.draft = null;
+      renderDraft();
+      void createObject('line', start, point);
+      return;
+    }
+    if (state.tool === 'rectangle') {
+      state.draft = { kind: 'rectangle', start: point, end: point };
       ui.svg.setPointerCapture(event.pointerId);
       renderDraft();
     }
@@ -1284,7 +1480,7 @@
     }
     const draft = state.draft;
     if (!draft?.start || !draft.end) return;
-    if (draft.kind === 'dimension') return;
+    if (draft.kind !== 'rectangle') return;
     state.draft = null;
     renderDraft();
     if (distance(draft.start, draft.end) < state.gridStep * 0.05) {
@@ -1312,11 +1508,25 @@
       event.currentTarget.setAttribute('aria-pressed', String(state.snapEnabled));
       setMessage(`Snap ${state.snapEnabled ? 'เปิด' : 'ปิด'}`);
     });
+    document.getElementById('tool-labels').addEventListener('click', event => {
+      state.labelsVisible = !state.labelsVisible;
+      event.currentTarget.classList.toggle('is-active', state.labelsVisible);
+      event.currentTarget.setAttribute('aria-pressed', String(state.labelsVisible));
+      renderScene();
+      setMessage(`Labels ${state.labelsVisible ? 'shown' : 'hidden'} · anchor and zone dots remain visible`);
+    });
     document.getElementById('tool-fit').addEventListener('click', fitView);
     document.getElementById('tool-zoom-in').addEventListener('click', () => zoomAt(0.8));
     document.getElementById('tool-zoom-out').addEventListener('click', () => zoomAt(1.25));
     ui.saveAnchorProperties.addEventListener('click', () => void saveAnchorProperties());
     ui.saveLineProperties.addEventListener('click', () => void saveLineProperties());
+    ui.precisionForm.addEventListener('submit', event => {
+      event.preventDefault();
+      void applyPrecisionInput();
+    });
+    ui.precisionLength.addEventListener('input', previewPrecisionInput);
+    ui.precisionAngle.addEventListener('input', previewPrecisionInput);
+    ui.registerHardware.addEventListener('click', () => void registerHardware());
     ui.gridSize.addEventListener('change', () => {
       const value = Number(ui.gridSize.value);
       if (!Number.isFinite(value) || value <= 0) {
@@ -1347,6 +1557,13 @@
       }
       if (event.key === 'Escape') cancelInteraction();
       if (event.key === 'Enter' && state.tool === 'zone' && !typing) finishZone();
+      if (!typing && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const shortcut = { l: 'line', r: 'rectangle', z: 'zone', d: 'dimension' }[event.key.toLowerCase()];
+        if (shortcut) {
+          event.preventDefault();
+          setTool(shortcut);
+        }
+      }
       if ((event.key === 'Delete' || event.key === 'Backspace') && !typing) {
         event.preventDefault();
         void deleteSelection();

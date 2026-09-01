@@ -26,7 +26,7 @@ importing `main`) is the way to do it — something like:
 ```python
 
 import os
-os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@127.0.0.1:5432/supalai_pytest"
+os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@10.10.32.92:5432/supostgres"
 os.environ["SIMULATOR_ENABLED"] = "false"
 
 from fastapi.testclient import TestClient

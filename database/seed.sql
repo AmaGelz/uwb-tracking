@@ -1,5 +1,5 @@
 -- =========================================================
--- SUPALAI-UWB — demo/seed data (PostgreSQL / Supabase)
+-- SUPALAI-UWB — demo/seed data (PostgreSQL)
 -- =========================================================
 -- Generated deterministically; safe to re-run (ON CONFLICT DO NOTHING).
 -- Demo accounts (password for all: 1234):

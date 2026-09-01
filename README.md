@@ -8,11 +8,10 @@ live floor-plan positions, per-visit dwell/timeline, and sales analytics
 SUPALAI-UWB/
 ├── SUPALAI-UWB-frontend/   Static frontend (no build step) — vanilla JS/HTML/CSS
 ├── backend/backend/        FastAPI backend — see backend/README.md
-├── database/                schema.sql + seed.sql (PostgreSQL / Supabase)
+├── database/                schema, migrations, and seed data (PostgreSQL)
 ├── migration/migration.py   applies schema/seed to a Postgres database
-├── data/config/              legacy reference JSON (see note below — no longer read by the app)
-├── hardware/anchor, hardware/tag   placeholders for real UWB firmware (not yet implemented — see note below)
-└── .env                      Supabase project URL/key
+├── hardware/                ESP32 UWB firmware and PlatformIO sources
+└── .env                      server-side PostgreSQL/API settings
 ```
 
 ## Quickstart
@@ -42,9 +41,7 @@ the Microsoft Store one — see
 starts throwing `Unable to create process using
 '...WindowsApps\PythonSoftwareFoundation...'`.
 
-Put a Postgres connection string in `backend/.env` as `DATABASE_URL`
-(Supabase dashboard → Project Settings → Database → Connection string
-→ URI — see the comment in `backend/.env` for details), then:
+Put a PostgreSQL connection string in `backend/.env` as `DATABASE_URL`, then:
 
 ```bash
 cd ..
@@ -58,8 +55,28 @@ directly, so there's nothing else to run. Sign in with
 `admin@supalai.com` / `1234` (see `backend/README.md` for the other
 demo accounts and what each role can see).
 
-No Supabase project yet? Leave `DATABASE_URL` empty and the backend
-falls back to a local Postgres at `127.0.0.1:5432/supalai_test`,
+## Azure App Service
+
+Deploy the repository root to a Linux App Service using Python 3.12. Oryx
+installs the root `requirements.txt`, which delegates to the Dashboard
+backend requirements. Configure `DATABASE_URL` and
+`HARDWARE_INGEST_SECRET` in **Configuration -> Application settings**. For
+production, also set `SEED_DEMO_DATA=false`, `SIMULATOR_ENABLED=false`, and
+normally `AUTO_MIGRATE=false` after applying migrations separately.
+
+Set **Configuration -> General settings -> Startup Command** to:
+
+```text
+gunicorn --chdir backend/backend --bind=0.0.0.0 --timeout 600 --workers 2 --worker-class uvicorn.workers.UvicornWorker main:app
+```
+
+This starts only [the Dashboard FastAPI application](backend/backend/main.py),
+which serves the frontend, authenticated APIs, WebSocket updates, and
+`POST /api/hardware/ingest`. The same command is provided by `startup.sh`.
+No separate root-level ingest application is deployed.
+
+If `DATABASE_URL` is empty, the backend falls back to a local PostgreSQL
+instance at `127.0.0.1:5432/supalai_test`,
 creating its own schema and demo data on first boot.
 
 ## Troubleshooting (Windows)
@@ -84,35 +101,16 @@ python.exe to PATH"), delete the broken `.venv`, and recreate it with
 the Store alias. `.venv/pyvenv.cfg`'s `home`/`executable` lines should
 point under `AppData\Local\Programs\Python\...`, never `WindowsApps`.
 
-**`psycopg2.OperationalError: could not translate host name "db.<ref>.supabase.co"`**
-Supabase's direct connection (`db.<ref>.supabase.co:5432`) is
-IPv6-only on many projects now, and most Windows networks can't route
-it. Use the **pooler** connection string instead — Supabase dashboard
-→ Project Settings → Database → Connection string → **Transaction
-pooler** tab (port `6543`, host
-`aws-0-<region>.pooler.supabase.com`, username `postgres.<project-ref>`).
-
-**Connection still fails after switching to the pooler string**
-Check the password wasn't copied with the placeholder's brackets still
-attached — `[YOUR-PASSWORD]` becomes `your-actual-password`, not
-`[your-actual-password]`.
-
 **`psycopg2.errors.UndefinedColumn: column "id" referenced in foreign key constraint does not exist` during migration**
-Something already exists in the Supabase project's `public` schema
+Something already exists in the target database's `public` schema
 with a different shape than `schema.sql` expects — every table uses
 `create table if not exists`, so a mismatched leftover table gets
 skipped instead of fixed, and whatever references it fails. If the
-project is dedicated to this app and has nothing else worth keeping,
-reset it in the Supabase SQL editor:
+database is dedicated to this app and has nothing else worth keeping,
+recreate the database before applying the migration. Do not drop a shared
+schema or a database that has not been backed up.
 
-```sql
-drop schema public cascade;
-create schema public;
-grant all on schema public to postgres;
-grant all on schema public to public;
-```
-
-then re-run `python migration/migration.py --seed`.
+Then re-run `python migration/migration.py` (add `--seed` only for demo data).
 
 **`PermissionError: [WinError 5] Access is denied` right after `Started reloader process ... using WatchFiles`**
 `uvicorn`'s `--reload` (tied to `DEBUG` in `backend/.env`) spawns a
@@ -123,45 +121,47 @@ or with certain antivirus/endpoint software. `DEBUG` only controls
 this reload behavior and nothing else, so setting `DEBUG=false` in
 `backend/.env` sidesteps it with no other side effects.
 
-## Database: Supabase / PostgreSQL
+## Database: PostgreSQL
 
-`database/schema.sql` is the full schema (idempotent — safe to re-run).
+For local setup and inspecting the same database with DBeaver, follow
+[`database/DBEAVER_SETUP.md`](database/DBEAVER_SETUP.md). DBeaver is the
+administration client; FastAPI connects directly to PostgreSQL rather than
+routing database traffic through DBeaver.
+
+For a hosted cutover, follow
+[`database/MIGRATING_FROM_SUPABASE.md`](database/MIGRATING_FROM_SUPABASE.md).
+
+`database/schema.sql` plus `database/migrations/*.sql` define the schema and
+are idempotent.
 `database/seed.sql` is ~3 weeks of synthetic demo visits across two
 sales reps so the analytics views have something real to show
-immediately. Both get applied automatically every time the backend
-starts, and can also be applied manually via `migration/migration.py`.
+immediately. Set `SEED_DEMO_DATA=false` in production. Schema changes can also
+be applied manually via `migration/migration.py`.
 
-The backend connects with `psycopg2` directly against Postgres rather
-than through the Supabase REST client — the analytics endpoints need
-real SQL joins/aggregations that are awkward over PostgREST. Row Level
-Security is enabled on every table with no policies attached, so if
-`SUPABASE_URL`/`SUPABASE_KEY` (the anon key in root `.env`) is ever
-used directly with `supabase-js`, it returns zero rows rather than
-leaking data — all access control lives in the backend.
+The backend connects to PostgreSQL with `psycopg2`; browser and firmware
+clients never receive database credentials. FastAPI owns authentication,
+role checks, analytics SQL, hardware ingestion, and live WebSocket fan-out.
 
-## No physical UWB hardware yet
+## UWB hardware
 
-`hardware/anchor/` and `hardware/tag/` are placeholders — writing
-actual firmware needs to know the specific hardware (which UWB chip,
-e.g. DW1000/DW3000, which MCU/board, which ranging protocol), which
-this project doesn't currently specify. In the meantime:
+Makerfabs ESP32 UWB / DW1000 firmware and setup instructions live under
+`hardware/`. See `hardware/PRODUCTION_SETUP.md` before flashing devices.
 
 - A background simulator (`backend/backend/simulator.py`) moves the
   seeded demo tags around the floor plan so the live map, visit
   history, and analytics all have real data to look at.
-- Real anchors/tags can be wired in later without any other backend
-  changes — point their ranging output at
-  `POST /api/positioning/{project_id}/ingest`, which runs through the
-  same code path the simulator uses. See `backend/README.md` →
-  "Connecting real UWB hardware".
+- Production gateways send HMAC-signed ranging frames to
+  `POST /api/hardware/ingest`; FastAPI maps surveyed anchors, calculates the
+  fix, and writes one idempotent PostgreSQL transaction.
+- The firmware already installed on the current Makerfabs tag can be retained.
+  It exposes JSON ranging data on TCP port `8888`; run the legacy bridge after
+  starting FastAPI:
 
-## `data/config/*.json`
+  ```powershell
+  cd backend
+  & .\.venv\Scripts\python.exe -m backend.legacy_tag_bridge
+  ```
 
-These are kept for reference (they're what the very first version of
-this project used to configure zones/anchors/people before it moved to
-a database), but **the running app no longer reads them** — zones and
-anchors are project-scoped rows in Postgres now, editable via the
-`/api/projects/{id}/anchors` endpoints, and people are rows in the
-`users` table. If you were editing these files expecting the app to
-pick up the changes, it won't — edit the database instead (or use
-`database/seed.sql` as a template for more demo data).
+  The computer must be able to reach the tag's existing IP (currently
+  `192.168.1.200`). The bridge converts Makerfabs `A`/`R` links into the
+  authenticated ingest API format, so no firmware flash is required.

@@ -69,16 +69,35 @@
     <section class="card editor-toolbar" aria-label="เครื่องมือวาดแปลน">
       <div class="tool-group" role="toolbar" aria-label="Drawing tools">
         <button class="tool-btn is-active" id="tool-select" data-tool="select" type="button" aria-pressed="true">Select</button>
-        <button class="tool-btn" id="tool-line" data-tool="line" type="button" aria-pressed="false">Line</button>
+        <button class="tool-btn" id="tool-line" data-tool="line" type="button" aria-pressed="false">Line / Polyline</button>
         <button class="tool-btn" id="tool-rectangle" data-tool="rectangle" type="button" aria-pressed="false">Rectangle</button>
         <button class="tool-btn" id="tool-zone" data-tool="zone" type="button" aria-pressed="false">Zone</button>
         <button class="tool-btn" id="tool-anchor" data-tool="anchor" type="button" aria-pressed="false">Anchor</button>
         <button class="tool-btn" id="tool-dimension" data-tool="dimension" type="button" aria-pressed="false">Dimension</button>
       </div>
+      <form class="precision-input" id="precision-input" hidden aria-label="Exact segment input">
+        <span class="precision-title" id="precision-title">Exact segment</span>
+        <label>
+          <span>Length</span>
+          <div class="precision-control">
+            <input id="precision-length" type="number" min="0.000001" step="0.01" inputmode="decimal" autocomplete="off">
+            <span>m</span>
+          </div>
+        </label>
+        <label>
+          <span>Angle</span>
+          <div class="precision-control">
+            <input id="precision-angle" type="number" step="0.01" inputmode="decimal" autocomplete="off">
+            <span>°</span>
+          </div>
+        </label>
+        <button class="tool-btn precision-apply" id="precision-apply" type="submit">Add</button>
+      </form>
       <div class="tool-group tool-actions" role="toolbar" aria-label="Editor actions">
         <button class="tool-btn tool-danger" id="tool-delete" type="button">Delete</button>
         <button class="tool-btn is-active" id="tool-grid" type="button" aria-pressed="true">Grid</button>
         <button class="tool-btn is-active" id="tool-snap" type="button" aria-pressed="true">Snap</button>
+        <button class="tool-btn is-active" id="tool-labels" type="button" aria-pressed="true">Labels</button>
         <button class="tool-btn" id="tool-zoom-out" type="button" aria-label="Zoom out">−</button>
         <button class="tool-btn" id="tool-zoom-in" type="button" aria-label="Zoom in">+</button>
         <button class="tool-btn" id="tool-fit" type="button">Fit</button>
@@ -92,7 +111,7 @@
             <span class="card-title">Drawing canvas</span>
             <span class="editor-unit-badge">m</span>
           </div>
-          <div class="editor-canvas-help">ล้อเมาส์: Zoom · Space/ปุ่มกลางลาก: Pan · Esc: ยกเลิก</div>
+          <div class="editor-canvas-help">Wheel: Zoom · Space/middle drag: Pan · L: Line · Esc: Finish/cancel</div>
         </div>
         <div class="editor-canvas-wrap" id="canvas-wrap">
           <svg id="editor-svg" role="img" aria-label="พื้นที่แก้ไขแปลนในหน่วยเมตร" tabindex="0">
@@ -174,6 +193,10 @@
               <label class="label" for="anchor-id-input">Anchor ID</label>
               <input class="control" id="anchor-id-input" autocomplete="off" placeholder="Auto: A1">
             </div>
+            <div class="field">
+              <label class="label" for="anchor-hardware-input">UWB hardware address</label>
+              <input class="control" id="anchor-hardware-input" maxlength="32" autocomplete="off" placeholder="เช่น 1782">
+            </div>
             <div class="field-row">
               <label class="sub"><span>Z</span>
                 <div class="input-with-unit">
@@ -212,6 +235,21 @@
               บันทึก Line properties
             </button>
           </div>
+          <div class="inspector-section" id="hardware-settings">
+            <span class="label">เชื่อมต่อ UWB hardware</span>
+            <div class="field">
+              <label class="label" for="gateway-device-input">Gateway device ID</label>
+              <input class="control" id="gateway-device-input" maxlength="100" value="SUPALAI-TAG-GW-01" autocomplete="off">
+            </div>
+            <div class="field">
+              <label class="label" for="hardware-tag-input">Tag ID</label>
+              <input class="control" id="hardware-tag-input" maxlength="100" value="TAG01" autocomplete="off">
+            </div>
+            <button class="btn btn-primary btn-block" id="register-hardware" type="button">
+              ลงทะเบียน Gateway และ Tag กับแปลนนี้
+            </button>
+            <div class="hint">Hardware address ของ Anchor ต้องตรงกับค่าที่ firmware ส่ง เช่น 1782, 1783, 1784</div>
+          </div>
           <div class="inspector-section">
             <label class="label" for="grid-size">Grid / Snap spacing</label>
             <div class="input-with-unit">
@@ -233,7 +271,6 @@
     </div>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="js/runtime-config.js"></script>
   <script src="js/api.js"></script>
   <script src="js/plan-editor.js"></script>

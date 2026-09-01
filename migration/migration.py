@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up (or migrate into) the SUPALAI-UWB Supabase/Postgres database.
+"""Set up (or migrate into) the SUPALAI-UWB PostgreSQL database.
 
 Usage:
     python migration/migration.py                               # create schema only
@@ -8,8 +8,8 @@ Usage:
                                                                     previous SQLite
                                                                     deployment
 
-Reads the target Postgres connection string from DATABASE_URL /
-SUPABASE_DB_URL — checks backend/.env and the repo-root .env, same as the
+Reads the target PostgreSQL connection string from DATABASE_URL and checks
+backend/.env and the repo-root .env, same as the
 running API (see backend/backend/config.py) — or from --database-url.
 """
 from __future__ import annotations
@@ -47,13 +47,11 @@ def resolve_database_url(explicit: str | None) -> str:
     if explicit:
         return explicit
     _load_dotenv_files()
-    url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+    url = os.getenv("DATABASE_URL")
     if not url:
         sys.exit(
-            "No DATABASE_URL set. Put your Supabase Postgres connection string in "
-            "backend/.env (Supabase dashboard -> Project Settings -> Database -> "
-            "Connection string -> URI — see the comment above DATABASE_URL in "
-            "backend/.env), or pass --database-url."
+            "No DATABASE_URL set. Put a PostgreSQL connection string in "
+            "backend/.env, or pass --database-url."
         )
     return url
 

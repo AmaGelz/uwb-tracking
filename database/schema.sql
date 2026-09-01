@@ -1,8 +1,7 @@
 -- =========================================================
--- SUPALAI-UWB — PostgreSQL / Supabase schema
+-- SUPALAI-UWB — PostgreSQL schema
 -- =========================================================
--- Run once against your Supabase project (SQL editor, or via
--- migration/migration.py). Safe to re-run: everything uses
+-- Apply with migration/migration.py. Safe to re-run: everything uses
 -- IF NOT EXISTS / OR REPLACE.
 --
 -- Design notes
@@ -17,7 +16,8 @@
 --   project can be tracked independently.
 -- =========================================================
 
-create extension if not exists pgcrypto;
+-- PostgreSQL 13+ provides gen_random_uuid() in core. Avoid requiring the
+-- pgcrypto extension because managed Azure servers may not allow-list it.
 
 -- ---------------------------------------------------------
 -- Identity & access
@@ -155,13 +155,11 @@ create index if not exists idx_notes_visit on notes(visit_key);
 -- ---------------------------------------------------------
 -- Row Level Security
 -- ---------------------------------------------------------
--- The API talks to Postgres with a direct connection (service-role
--- level access — see backend/.env), which bypasses RLS by design:
--- all access control (who can see whose visits, who can edit) is
--- enforced in backend/backend/main.py. RLS is enabled with no
--- policies attached, so if anyone ever points supabase-js's
--- anon/authenticated client at this project directly, every table
--- here returns zero rows instead of leaking data.
+-- The API talks to Postgres with a direct, dedicated role. Application
+-- access control (who can see whose visits, who can edit) is enforced in
+-- backend/backend/main.py. Table owners bypass RLS automatically; a separate
+-- runtime role must be granted privileges and its explicit RLS policies with
+-- database/configure_backend_role.sql.
 -- ---------------------------------------------------------
 
 alter table users     enable row level security;

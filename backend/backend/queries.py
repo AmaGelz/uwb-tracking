@@ -334,7 +334,7 @@ def create_plan_zone(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | Non
 def get_plan_anchors(plan_id: str) -> list[dict[str, Any]]:
     rows = db.fetchall(
         """
-        SELECT anchor_id, project_id, plan_id, x, y, z, mount_height_m,
+        SELECT anchor_id, project_id, plan_id, hardware_address, x, y, z, mount_height_m,
                battery, last_ts
         FROM anchors
         WHERE plan_id = %s
@@ -356,15 +356,16 @@ def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | N
     row = db.fetchone(
         """
         INSERT INTO anchors (
-            project_id, plan_id, anchor_id, x, y, z, mount_height_m,
+            project_id, plan_id, anchor_id, hardware_address, x, y, z, mount_height_m,
             battery, last_ts
         )
-        SELECT project_id, id, %s, %s, %s, %s, %s, %s, %s
+        SELECT project_id, id, %s, %s, %s, %s, %s, %s, %s, %s
         FROM plans
         WHERE id = %s
         ON CONFLICT (project_id, anchor_id)
         DO UPDATE SET
             plan_id = EXCLUDED.plan_id,
+            hardware_address = EXCLUDED.hardware_address,
             x = EXCLUDED.x,
             y = EXCLUDED.y,
             z = EXCLUDED.z,
@@ -374,7 +375,7 @@ def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | N
         RETURNING anchor_id
         """,
         (
-            data["anchor_id"], data["x"], data["y"], data.get("z"),
+            data["anchor_id"], data.get("hardware_address"), data["x"], data["y"], data.get("z"),
             data.get("mount_height_m"), data.get("battery"), utc_now(), plan_id,
         ),
     )
@@ -432,17 +433,25 @@ def zone_for_point(zones: list[dict[str, Any]], x: float, y: float) -> str | Non
     return None
 
 
-def get_anchors(project_id: str | None = None) -> list[dict[str, Any]]:
-    where = "WHERE project_id = %s" if project_id else ""
-    params = (project_id,) if project_id else ()
+def get_anchors(project_id: str | None = None, plan_id: str | None = None) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if project_id:
+        conditions.append("project_id = %s")
+        params.append(project_id)
+    if plan_id:
+        conditions.append("plan_id = %s")
+        params.append(plan_id)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = db.fetchall(
         f"""
-        SELECT anchor_id, project_id, x, y, battery, last_ts
+        SELECT anchor_id, project_id, plan_id, hardware_address, x, y, z,
+               mount_height_m, battery, last_ts
         FROM anchors
         {where}
         ORDER BY anchor_id
         """,
-        params,
+        tuple(params),
     )
     now = utc_now()
     for a in rows:
@@ -455,19 +464,27 @@ def touch_anchors(project_id: str) -> None:
     db.execute("UPDATE anchors SET last_ts = %s WHERE project_id = %s", (utc_now(), project_id))
 
 
-def get_tags(project_id: str | None = None) -> list[dict[str, Any]]:
-    where = "WHERE t.project_id = %s" if project_id else ""
-    params = (project_id,) if project_id else ()
+def get_tags(project_id: str | None = None, plan_id: str | None = None) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if project_id:
+        conditions.append("t.project_id = %s")
+        params.append(project_id)
+    if plan_id:
+        conditions.append("t.plan_id = %s")
+        params.append(plan_id)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = db.fetchall(
         f"""
-        SELECT t.tag_id, t.project_id, t.x, t.y, t.battery, t.last_ts,
+        SELECT t.tag_id, t.project_id, t.plan_id, t.x, t.y, t.z,
+               t.battery, t.last_ts, t.source, t.device_id,
                u.first_en || ' ' || u.last_en AS sale_name
         FROM tags t
         LEFT JOIN users u ON u.employee_id = t.employee_id
         {where}
         ORDER BY t.tag_id
         """,
-        params,
+        tuple(params),
     )
     now = utc_now()
     for t in rows:
@@ -476,16 +493,27 @@ def get_tags(project_id: str | None = None) -> list[dict[str, Any]]:
     return rows
 
 
-def get_live_tags(rows: int = 400, since: float = 0) -> dict[str, Any]:
-    tags = get_tags()
+def get_live_tags(
+    rows: int = 400,
+    since: float = 0,
+    project_id: str | None = None,
+    plan_id: str | None = None,
+) -> dict[str, Any]:
+    rows = min(max(rows, 0), 5000)
+    tags = get_tags(project_id, plan_id)
     result = {
         t["tag_id"]: {
+            "project_id": t["project_id"],
+            "plan_id": t["plan_id"],
             "x": t["x"],
             "y": t["y"],
+            "z": t["z"],
             "battery": t["battery"],
             "on": t["on"],
             "sale_name": t["sale_name"],
             "last_ts": t["last_ts"],
+            "source": t["source"],
+            "device_id": t["device_id"],
         }
         for t in tags
     }
@@ -493,14 +521,26 @@ def get_live_tags(rows: int = 400, since: float = 0) -> dict[str, Any]:
     trail: list[dict[str, Any]] = []
     if rows > 0:
         since_dt = datetime.fromtimestamp(since, tz=timezone.utc) if since else None
-        clause = "WHERE ts > %s" if since_dt else ""
-        params = (since_dt,) if since_dt else ()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if since_dt:
+            conditions.append("ts > %s")
+            params.append(since_dt)
+        if project_id:
+            conditions.append("project_id = %s")
+            params.append(project_id)
+        if plan_id:
+            conditions.append("plan_id = %s")
+            params.append(plan_id)
+        clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         trail_rows = db.fetchall(
-            f"SELECT tag_id, x, y, zone, ts FROM positions {clause} ORDER BY ts DESC LIMIT %s",
+            f"""SELECT tag_id, project_id, plan_id, x, y, z, zone, ts,
+                       source, residual_m, anchors_used, device_id
+                FROM positions {clause} ORDER BY ts DESC LIMIT %s""",
             (*params, rows),
         )
         trail = [
-            {"tag_id": r["tag_id"], "x": r["x"], "y": r["y"], "zone": r["zone"], "ts": to_epoch(r["ts"])}
+            {**r, "ts": to_epoch(r["ts"])}
             for r in trail_rows
         ]
 
