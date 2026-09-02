@@ -68,6 +68,28 @@ class Settings:
     seed_demo_data: bool = _bool("SEED_DEMO_DATA", True)
 
     google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    google_workspace_domain: str = os.getenv("GOOGLE_WORKSPACE_DOMAIN", "").lower().strip()
+
+    # Account email. Without a configured provider in debug mode, one-time
+    # links are written to the backend log so local development remains usable.
+    frontend_base_url: str = os.getenv("FRONTEND_BASE_URL", "http://127.0.0.1:8000")
+    password_reset_minutes: int = int(os.getenv("PASSWORD_RESET_MINUTES", "30"))
+    password_reset_cooldown_seconds: int = int(os.getenv("PASSWORD_RESET_COOLDOWN_SECONDS", "60"))
+    activation_hours: int = int(os.getenv("ACTIVATION_HOURS", "24"))
+    mail_provider: str = os.getenv("MAIL_PROVIDER", "auto").lower().strip()
+    gmail_sender_email: str = os.getenv("GMAIL_SENDER_EMAIL", "")
+    google_service_account_file: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "")
+    google_service_account_json: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    gmail_oauth_client_id: str = os.getenv("GMAIL_OAUTH_CLIENT_ID", "")
+    gmail_oauth_client_secret: str = os.getenv("GMAIL_OAUTH_CLIENT_SECRET", "")
+    gmail_oauth_refresh_token: str = os.getenv("GMAIL_OAUTH_REFRESH_TOKEN", "")
+    smtp_host: str = os.getenv("SMTP_HOST", "")
+    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username: str = os.getenv("SMTP_USERNAME", "")
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "")
+    smtp_from_email: str = os.getenv("SMTP_FROM_EMAIL", "")
+    smtp_starttls: bool = _bool("SMTP_STARTTLS", True)
+    smtp_use_ssl: bool = _bool("SMTP_USE_SSL", False)
 
     # Live position simulator (no real UWB hardware connected yet).
     # Turn off with SIMULATOR_ENABLED=false once real anchors/tags are wired in.

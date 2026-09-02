@@ -8,6 +8,8 @@ pytest tests/ -v
 These cover the pure-logic modules that don't need a database:
 `positioning.py` (trilateration math), `calculations.py` (anchor
 placement / coverage geometry), and `security.py` (password hashing).
+`mailer.py` is also tested with fake Gmail API OAuth and SMTP transports, so
+the suite never sends a real email.
 
 ## What's *not* covered here
 

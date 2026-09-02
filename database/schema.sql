@@ -27,7 +27,11 @@ create table if not exists users (
     id              text primary key,
     employee_id     text unique not null,
     email           text unique not null,
-    password_hash   text not null,
+    password_hash   text,
+    google_sub      text,
+    account_status  text not null default 'active'
+                        check (account_status in ('pending', 'active', 'disabled')),
+    activated_at    timestamptz,
     role            text not null default 'sale'
                         check (role in ('admin', 'sale_lead', 'sale')),
     position        text not null default '',
@@ -39,6 +43,10 @@ create table if not exists users (
     tag_id          text,
     created_at      timestamptz not null default now()
 );
+-- The google_sub index is created by migration 004. Keeping it there is
+-- important for existing databases: CREATE TABLE IF NOT EXISTS above does not
+-- add google_sub to an already-existing users table, so indexing it here would
+-- fail before the migration gets a chance to add the column.
 
 create table if not exists sessions (
     token       text primary key,
@@ -46,6 +54,18 @@ create table if not exists sessions (
     expires_at  timestamptz not null
 );
 create index if not exists idx_sessions_user on sessions(user_id);
+
+create table if not exists password_reset_tokens (
+    token_hash  text primary key,
+    user_id     text not null references users(id) on delete cascade,
+    expires_at  timestamptz not null,
+    used_at     timestamptz,
+    created_at  timestamptz not null default now(),
+    purpose     text not null default 'reset'
+                    check (purpose in ('reset', 'activation'))
+);
+create index if not exists idx_password_reset_user_created
+    on password_reset_tokens(user_id, created_at desc);
 
 -- ---------------------------------------------------------
 -- Projects, floor plans, zones, hardware
@@ -164,6 +184,7 @@ create index if not exists idx_notes_visit on notes(visit_key);
 
 alter table users     enable row level security;
 alter table sessions  enable row level security;
+alter table password_reset_tokens enable row level security;
 alter table projects  enable row level security;
 alter table zones     enable row level security;
 alter table anchors   enable row level security;

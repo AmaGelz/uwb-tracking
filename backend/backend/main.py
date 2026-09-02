@@ -4,14 +4,16 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import math
 from pathlib import Path
 import re
+import secrets
 import time
-from datetime import datetime, timezone
-from typing import Annotated, Any
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from psycopg2 import Error as DatabaseError
@@ -26,12 +28,21 @@ import tracking
 from config import settings
 from db import db, init_db, seed_demo_data
 from live_hub import LiveHub, session_token_from_protocol_header
-from security import create_token, password_verify, public_user
+from mailer import send_activation_email, send_password_reset_email
+from security import (
+    create_password_reset_token,
+    create_token,
+    password_hash,
+    password_reset_token_hash,
+    password_verify,
+    public_user,
+)
 from simulator import simulator
 from utils import utc_now
 
 
 live_hub = LiveHub(lambda: q.get_live_tags(rows=0), interval=0.25)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.app_name,
@@ -68,6 +79,27 @@ class SignInRequest(BaseModel):
 
 class GoogleSignInRequest(BaseModel):
     credential: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=500)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class UserInviteRequest(BaseModel):
+    employee_id: str = Field(min_length=1, max_length=50)
+    email: str = Field(min_length=3, max_length=320)
+    role: Literal["admin", "sale_lead", "sale"] = "sale"
+    position: str = Field(default="", max_length=200)
+    first_th: str = Field(default="", max_length=100)
+    last_th: str = Field(default="", max_length=100)
+    first_en: str = Field(default="", max_length=100)
+    last_en: str = Field(default="", max_length=100)
+    phone: str = Field(default="", max_length=50)
 
 
 class ProjectCreate(BaseModel):
@@ -193,7 +225,11 @@ def current_user(x_session: str | None) -> dict[str, Any] | None:
     user_id = q.get_session_user(x_session)
     if not user_id:
         return None
-    return q.get_user_by_id(user_id)
+    user = q.get_user_by_id(user_id)
+    if not user or user.get("account_status", "active") != "active":
+        q.delete_session(x_session)
+        return None
+    return user
 
 
 def require_user(x_session: str | None) -> dict[str, Any]:
@@ -369,14 +405,22 @@ def health():
 @app.get("/api/auth/google-config")
 def google_config():
     enabled = bool(settings.google_client_id)
-    return {"enabled": enabled, "client_id": settings.google_client_id if enabled else None}
+    return {
+        "enabled": enabled,
+        "client_id": settings.google_client_id if enabled else None,
+        "hosted_domain": settings.google_workspace_domain or None,
+    }
 
 
 @app.post("/api/signin")
 def signin(payload: SignInRequest):
     user = q.get_user_by_email(payload.email.strip().lower())
-    if not user or not password_verify(payload.password, user["password_hash"]):
-        return {"ok": False, "error": "Email หรือ Password ไม่ถูกต้อง"}
+    if (
+        not user
+        or user.get("account_status", "active") != "active"
+        or not password_verify(payload.password, user.get("password_hash"))
+    ):
+        return {"ok": False, "error": "Email หรือ Password ไม่ถูกต้อง หรือบัญชียังไม่เปิดใช้งาน"}
     token = create_token(user["id"])
     return {"ok": True, "token": token, "user": public_user(user)}
 
@@ -386,6 +430,50 @@ def signout(x_session: str | None = Header(default=None)):
     if x_session:
         q.delete_session(x_session)
     return {"ok": True}
+
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(payload: ForgotPasswordRequest, background_tasks: BackgroundTasks):
+    """Create and email a one-time reset link without revealing account existence."""
+    response = {
+        "ok": True,
+        "message": "หากอีเมลนี้อยู่ในระบบ เราได้ส่งลิงก์สำหรับตั้งรหัสผ่านใหม่แล้ว",
+    }
+    user = q.get_user_by_email(payload.email.strip().lower())
+    if (
+        not user
+        or user.get("account_status", "active") != "active"
+        or q.has_recent_password_reset(user["id"], settings.password_reset_cooldown_seconds)
+    ):
+        return response
+
+    token, token_hash = create_password_reset_token()
+    expires_at = utc_now() + timedelta(minutes=settings.password_reset_minutes)
+    q.create_password_reset(user["id"], token_hash, expires_at)
+    # Keep the token in the URL fragment so browsers do not send it to the
+    # web server in request logs or Referer headers.
+    reset_url = f"{settings.frontend_base_url.rstrip('/')}/reset-password.html#token={token}"
+    background_tasks.add_task(send_password_reset_email, user["email"], reset_url)
+    return response
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(payload: ResetPasswordRequest):
+    token_hash = password_reset_token_hash(payload.token)
+    if not q.password_reset_is_valid(token_hash):
+        raise HTTPException(status_code=400, detail="ลิงก์ตั้งรหัสผ่านไม่ถูกต้อง หมดอายุ หรือถูกใช้ไปแล้ว")
+    purpose = q.consume_password_reset(
+        token_hash,
+        password_hash(payload.new_password),
+    )
+    if not purpose:
+        raise HTTPException(status_code=400, detail="ลิงก์ตั้งรหัสผ่านไม่ถูกต้อง หมดอายุ หรือถูกใช้ไปแล้ว")
+    message = (
+        "เปิดใช้งานบัญชีและตั้งรหัสผ่านเรียบร้อยแล้ว กรุณาเข้าสู่ระบบ"
+        if purpose == "activation"
+        else "ตั้งรหัสผ่านใหม่เรียบร้อยแล้ว กรุณาเข้าสู่ระบบอีกครั้ง"
+    )
+    return {"ok": True, "purpose": purpose, "message": message}
 
 
 @app.post("/api/google-signin")
@@ -398,19 +486,117 @@ def google_signin(payload: GoogleSignInRequest):
 
         info = id_token.verify_oauth2_token(payload.credential, google_requests.Request(), settings.google_client_id)
         email = str(info.get("email", "")).lower().strip()
-        if not email:
-            return {"ok": False, "error": "Google ไม่ส่ง email กลับมา"}
+        google_sub = str(info.get("sub", "")).strip()
+        if not email or not google_sub or not info.get("email_verified"):
+            return {"ok": False, "error": "บัญชี Google ไม่มีอีเมลที่ยืนยันแล้ว"}
+        if settings.google_workspace_domain and info.get("hd") != settings.google_workspace_domain:
+            return {"ok": False, "error": f"กรุณาใช้บัญชี Google Workspace @{settings.google_workspace_domain}"}
 
-        user = q.get_user_by_email(email)
+        user = q.get_user_by_google_sub(google_sub)
         if not user:
-            return {"ok": False, "error": "ไม่พบ email นี้ในระบบ SUPALAI"}
+            user = q.get_user_by_email(email)
+            if user:
+                try:
+                    user = q.link_google_account(user["id"], google_sub)
+                except UniqueViolation:
+                    user = q.get_user_by_google_sub(google_sub)
+        if not user:
+            return {"ok": False, "error": "ยังไม่มีบัญชีนี้ในระบบ กรุณาติดต่อ Admin เพื่อส่งคำเชิญ"}
+        if user.get("account_status", "active") == "pending":
+            return {"ok": False, "error": "บัญชียังไม่เปิดใช้งาน กรุณาเปิดลิงก์คำเชิญในอีเมลก่อน"}
+        if user.get("account_status", "active") != "active":
+            return {"ok": False, "error": "บัญชีนี้ถูกระงับการใช้งาน"}
 
         token = create_token(user["id"])
         return {"ok": True, "token": token, "user": public_user(user)}
     except ImportError:
         return {"ok": False, "error": "ยังไม่ได้ติดตั้ง google-auth"}
-    except Exception as exc:
-        return {"ok": False, "error": f"Google authentication failed: {exc}"}
+    except Exception:
+        logger.exception("Google Sign-In failed")
+        return {"ok": False, "error": "Google Sign-In ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"}
+
+
+def _account_link(token: str) -> str:
+    return f"{settings.frontend_base_url.rstrip('/')}/reset-password.html#token={token}"
+
+
+def _admin_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": user["id"],
+        "employee_id": user["employee_id"],
+        "email": user["email"],
+        "role": user["role"],
+        "position": user["position"],
+        "first_th": user["first_th"],
+        "last_th": user["last_th"],
+        "first_en": user["first_en"],
+        "last_en": user["last_en"],
+        "phone": user.get("phone", ""),
+        "tag_id": user.get("tag_id"),
+        "account_status": user.get("account_status", "active"),
+        "google_linked": bool(user.get("google_sub")),
+        "activated_at": user.get("activated_at"),
+        "created_at": user.get("created_at"),
+    }
+
+
+@app.get("/api/admin/users")
+def admin_users(x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    return {"ok": True, "users": [_admin_user(user) for user in q.all_users()]}
+
+
+@app.post("/api/admin/users/invite", status_code=201)
+def admin_invite_user(
+    payload: UserInviteRequest,
+    background_tasks: BackgroundTasks,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    data = payload.model_dump()
+    data["employee_id"] = data["employee_id"].strip()
+    data["email"] = data["email"].strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", data["email"]):
+        raise HTTPException(status_code=422, detail="รูปแบบอีเมลไม่ถูกต้อง")
+
+    token, token_hash = create_password_reset_token()
+    expires_at = utc_now() + timedelta(hours=settings.activation_hours)
+    try:
+        user = q.create_invited_user(
+            f"u-{secrets.token_hex(8)}",
+            data,
+            token_hash,
+            expires_at,
+        )
+    except UniqueViolation:
+        raise HTTPException(status_code=409, detail="อีเมลหรือรหัสพนักงานนี้มีอยู่ในระบบแล้ว")
+    if not user:
+        raise HTTPException(status_code=500, detail="สร้างบัญชีไม่สำเร็จ")
+
+    background_tasks.add_task(send_activation_email, user["email"], _account_link(token))
+    return {"ok": True, "message": "สร้างบัญชีและส่งคำเชิญแล้ว", "user": _admin_user(user)}
+
+
+@app.post("/api/admin/users/{user_id}/resend-invitation")
+def admin_resend_invitation(
+    user_id: str,
+    background_tasks: BackgroundTasks,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    user = q.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="ไม่พบบัญชีผู้ใช้")
+    if user.get("account_status") != "pending":
+        raise HTTPException(status_code=409, detail="ส่งคำเชิญซ้ำได้เฉพาะบัญชีที่ยัง pending")
+    if q.has_recent_password_reset(user_id, settings.password_reset_cooldown_seconds, "activation"):
+        return {"ok": True, "message": "คำเชิญถูกส่งไปเมื่อไม่นานนี้ กรุณารอสักครู่"}
+
+    token, token_hash = create_password_reset_token()
+    expires_at = utc_now() + timedelta(hours=settings.activation_hours)
+    q.create_password_reset(user_id, token_hash, expires_at, "activation")
+    background_tasks.add_task(send_activation_email, user["email"], _account_link(token))
+    return {"ok": True, "message": "ส่งคำเชิญอีกครั้งแล้ว"}
 
 
 @app.get("/api/me")
@@ -441,6 +627,7 @@ def bootstrap(x_session: str | None = Header(default=None)):
             "position": p["position"], "tag_id": p.get("tag_id"),
         }
         for p in q.all_users()
+        if p.get("account_status", "active") == "active"
     ]
     customers = db.fetchall("SELECT id, name FROM customers ORDER BY name")
 
@@ -1192,6 +1379,14 @@ def frontend_login():
 @app.get("/dashboard.html", include_in_schema=False)
 def frontend_dashboard():
     file = FRONTEND_DIR / "dashboard.html"
+    if file.exists():
+        return FileResponse(file)
+    raise HTTPException(status_code=404)
+
+
+@app.get("/reset-password.html", include_in_schema=False)
+def frontend_reset_password():
+    file = FRONTEND_DIR / "reset-password.html"
     if file.exists():
         return FileResponse(file)
     raise HTTPException(status_code=404)

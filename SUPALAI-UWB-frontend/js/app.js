@@ -308,6 +308,7 @@ const MENU = [
     { id: 'visits', label: 'บันทึกการเยี่ยมชมโครงการ' },
   ] },
   { group: 'ตั้งค่า', roles: ['admin'], items: [
+    { id: 'users', label: 'จัดการผู้ใช้งาน' },
     { id: 'plan-editor', label: 'Plan Editor', href: 'plan-editor.html' },
     { id: 'devices', label: 'ตั้งค่าอุปกรณ์' },
     { id: 'device-tracking', label: 'ติดตามอุปกรณ์' },
@@ -949,6 +950,101 @@ function noteModal(key) {
   };
 }
 
+async function pageUsers() {
+  const result = await requestApi('/api/admin/users');
+  const users = result.users || [];
+  const notice = S.userNotice;
+  S.userNotice = null;
+  const statusBadge = status => {
+    const cls = status === 'active' ? 'badge-on' : status === 'pending' ? 'badge-pending' : 'badge-off';
+    return `<span class="badge ${cls}">${esc(String(status || '').toUpperCase())}</span>`;
+  };
+
+  render(`
+    <div class="page-head"><h1>จัดการผู้ใช้งาน</h1>
+      <span class="page-sub">สร้างบัญชีแบบ pending และส่งลิงก์ให้ผู้ใช้ตั้งรหัสผ่านครั้งแรก</span></div>
+    <div class="card"><div class="card-head"><span class="card-title">เชิญผู้ใช้ใหม่</span></div>
+      <div class="card-body">
+        <div id="user-message">${notice ? `<div class="success">${esc(notice)}</div>` : ''}</div>
+        <form id="invite-user-form">
+          <div class="invite-grid">
+            <div class="field"><label class="label" for="iu-employee">รหัสพนักงาน</label>
+              <input class="control" id="iu-employee" maxlength="50" required></div>
+            <div class="field"><label class="label" for="iu-email">Email</label>
+              <input class="control" id="iu-email" type="email" maxlength="320" required></div>
+            <div class="field"><label class="label" for="iu-role">สิทธิ์</label>
+              <select class="control" id="iu-role">
+                <option value="sale">Sale</option><option value="sale_lead">Sale Lead</option>
+                <option value="admin">Admin</option></select></div>
+            <div class="field"><label class="label" for="iu-position">ตำแหน่ง</label>
+              <input class="control" id="iu-position" maxlength="200"></div>
+            <div class="field"><label class="label" for="iu-first-th">ชื่อ (ไทย)</label>
+              <input class="control" id="iu-first-th" maxlength="100"></div>
+            <div class="field"><label class="label" for="iu-last-th">นามสกุล (ไทย)</label>
+              <input class="control" id="iu-last-th" maxlength="100"></div>
+            <div class="field"><label class="label" for="iu-first-en">ชื่อ (อังกฤษ)</label>
+              <input class="control" id="iu-first-en" maxlength="100"></div>
+            <div class="field"><label class="label" for="iu-last-en">นามสกุล (อังกฤษ)</label>
+              <input class="control" id="iu-last-en" maxlength="100"></div>
+          </div>
+          <button class="btn btn-primary" type="submit">สร้างบัญชีและส่งคำเชิญ</button>
+        </form>
+      </div></div>
+    <div class="card"><div class="card-head"><span class="card-title">บัญชีผู้ใช้งาน (${users.length})</span></div>
+      <div class="card-body flush"><div class="table-wrap"><table class="data">
+        <thead><tr><th>รหัสพนักงาน</th><th>ชื่อ</th><th>Email</th><th>สิทธิ์</th>
+          <th>สถานะ</th><th>Google</th><th></th></tr></thead>
+        <tbody>${users.length ? users.map(user => `
+          <tr><td>${esc(user.employee_id)}</td>
+            <td>${esc(`${user.first_th || user.first_en || ''} ${user.last_th || user.last_en || ''}`.trim() || '—')}</td>
+            <td>${esc(user.email)}</td><td>${esc(user.role)}</td>
+            <td>${statusBadge(user.account_status)}</td>
+            <td><span class="badge ${user.google_linked ? 'badge-on' : 'badge-none'}">${user.google_linked ? 'LINKED' : '—'}</span></td>
+            <td>${user.account_status === 'pending'
+              ? `<button class="btn invite-resend" data-user-id="${esc(user.id)}">ส่งอีกครั้ง</button>` : ''}</td></tr>`).join('')
+          : emptyRow(7, 'ยังไม่มีผู้ใช้งาน')}</tbody>
+      </table></div></div></div>`);
+
+  const form = $('#invite-user-form');
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const button = $('button[type="submit"]', form);
+    button.disabled = true;
+    $('#user-message').replaceChildren();
+    try {
+      const response = await requestApi('/api/admin/users/invite', {
+        method: 'POST',
+        body: JSON.stringify({
+          employee_id: $('#iu-employee').value.trim(), email: $('#iu-email').value.trim(),
+          role: $('#iu-role').value, position: $('#iu-position').value.trim(),
+          first_th: $('#iu-first-th').value.trim(), last_th: $('#iu-last-th').value.trim(),
+          first_en: $('#iu-first-en').value.trim(), last_en: $('#iu-last-en').value.trim(),
+        }),
+      });
+      S.userNotice = response.message;
+      await pageUsers();
+    } catch (error) {
+      $('#user-message').innerHTML = `<div class="err">${esc(error.message)}</div>`;
+      button.disabled = false;
+    }
+  };
+  document.querySelectorAll('.invite-resend').forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const response = await requestApi(`/api/admin/users/${encodeURIComponent(button.dataset.userId)}/resend-invitation`, {
+          method: 'POST',
+        });
+        S.userNotice = response.message;
+        await pageUsers();
+      } catch (error) {
+        $('#user-message').innerHTML = `<div class="err">${esc(error.message)}</div>`;
+        button.disabled = false;
+      }
+    };
+  });
+}
+
 async function pageDevices() {
   const dev = await requestApi(scopedApiPath('/api/devices'));
   render(`
@@ -1245,6 +1341,7 @@ const ROUTES = {
   project: pageProject,
   sales: pageSales,
   visits: pageVisits,
+  users: pageUsers,
   devices: pageDevices,
   'device-tracking': pageDeviceTracking,
 };

@@ -21,11 +21,16 @@
     <div class="field">
       <label class="label" for="si-pw">Password</label>
       <input class="control" id="si-pw" type="password" autocomplete="current-password" required>
+      <div class="signin-password-actions">
+        <a class="signin-forgot" href="reset-password.html">ลืมรหัสผ่าน?</a>
+      </div>
     </div>
-    <button class="btn btn-primary btn-block" type="submit">Next</button>
-    <div class="signin-divider"><span>OR</span></div>
-    <div class="google-wrap" id="google-btn"></div>
-    <div class="signin-hint">เข้าสู่ระบบด้วยบัญชีที่จัดเก็บในระบบ PostgreSQL</div>
+    <button class="btn btn-primary btn-block" type="submit">เข้าสู่ระบบ</button>
+    <div class="signin-divider"><span>หรือ</span></div>
+    <div class="google-wrap" id="google-btn" aria-live="polite" aria-busy="true">
+      <div class="google-disabled">กำลังโหลด Google Sign-In…</div>
+    </div>
+    <div class="signin-hint">เข้าสู่ระบบด้วย Email และ Password หรือบัญชี Google ที่ผูกกับระบบ</div>
   </form>
   <script src="js/runtime-config.js"></script>
   <script src="js/api.js"></script>

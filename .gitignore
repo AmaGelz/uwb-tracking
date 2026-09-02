@@ -20,6 +20,8 @@ venv/
 # signing keys. Keep them out of version control; share them out of band.
 .env
 backend/.env
+backend/*service-account*.json
+google-service-account*.json
 hardware/**/secrets.h
 hardware/**/ingest_secret.h
 .pio/

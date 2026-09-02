@@ -75,6 +75,23 @@ which serves the frontend, authenticated APIs, WebSocket updates, and
 `POST /api/hardware/ingest`. The same command is provided by `startup.sh`.
 No separate root-level ingest application is deployed.
 
+For activation/password-reset emails through Gmail API OAuth, configure the
+public frontend URL, Google Sign-In client, and one Gmail credential method:
+
+```env
+FRONTEND_BASE_URL=https://tracking.example.com
+GOOGLE_CLIENT_ID=your-web-client.apps.googleusercontent.com
+GOOGLE_WORKSPACE_DOMAIN=example.com
+MAIL_PROVIDER=gmail_api
+GMAIL_SENDER_EMAIL=no-reply@example.com
+GOOGLE_SERVICE_ACCOUNT_FILE=/run/secrets/google-service-account.json
+```
+
+Reset links expire after 30 minutes by default. Override this with
+`PASSWORD_RESET_MINUTES`. With `DEBUG=true` and no mail configuration, the
+backend writes the link to its log for local testing; it never returns the
+token in the API response.
+
 If `DATABASE_URL` is empty, the backend falls back to a local PostgreSQL
 instance at `127.0.0.1:5432/supalai_test`,
 creating its own schema and demo data on first boot.

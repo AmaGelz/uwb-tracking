@@ -29,11 +29,28 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
     return db.fetchone("SELECT * FROM users WHERE id = %s", (user_id,))
 
 
+def get_user_by_google_sub(google_sub: str) -> dict[str, Any] | None:
+    return db.fetchone("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+
+
+def link_google_account(user_id: str, google_sub: str) -> dict[str, Any] | None:
+    return db.execute_returning(
+        """
+        UPDATE users
+        SET google_sub = %s
+        WHERE id = %s AND (google_sub IS NULL OR google_sub = %s)
+        RETURNING *
+        """,
+        (google_sub, user_id, google_sub),
+    )
+
+
 def all_users() -> list[dict[str, Any]]:
     return db.fetchall(
         """
         SELECT id, employee_id, email, role, position,
-               first_th, last_th, first_en, last_en, tag_id, password_hash
+               first_th, last_th, first_en, last_en, phone, tag_id,
+               password_hash, google_sub, account_status, activated_at, created_at
         FROM users
         ORDER BY employee_id
         """
@@ -55,6 +72,135 @@ def get_session_user(token: str) -> str | None:
         delete_session(token)
         return None
     return row["user_id"]
+
+
+def has_recent_password_reset(user_id: str, cooldown_seconds: int, purpose: str = "reset") -> bool:
+    row = db.fetchone(
+        """
+        SELECT 1
+        FROM password_reset_tokens
+        WHERE user_id = %s
+          AND purpose = %s
+          AND created_at > now() - (%s * interval '1 second')
+        LIMIT 1
+        """,
+        (user_id, purpose, cooldown_seconds),
+    )
+    return row is not None
+
+
+def create_password_reset(
+    user_id: str,
+    token_hash: str,
+    expires_at: datetime,
+    purpose: str = "reset",
+) -> None:
+    # A new request retires earlier links for this account. The CTE keeps the
+    # invalidation and insertion in one transaction.
+    db.execute(
+        """
+        WITH invalidated AS (
+            UPDATE password_reset_tokens
+            SET used_at = now()
+            WHERE user_id = %s AND purpose = %s AND used_at IS NULL
+            RETURNING token_hash
+        )
+        INSERT INTO password_reset_tokens (token_hash, user_id, expires_at, purpose)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (user_id, purpose, token_hash, user_id, expires_at, purpose),
+    )
+
+
+def password_reset_is_valid(token_hash: str) -> bool:
+    row = db.fetchone(
+        """
+        SELECT 1
+        FROM password_reset_tokens
+        WHERE token_hash = %s AND used_at IS NULL AND expires_at > now()
+        """,
+        (token_hash,),
+    )
+    return row is not None
+
+
+def consume_password_reset(token_hash: str, new_password_hash: str) -> str | None:
+    """Atomically consume a valid token, update the password, and sign out all devices."""
+    row = db.execute_returning(
+        """
+        WITH claimed AS (
+            UPDATE password_reset_tokens
+            SET used_at = now()
+            WHERE token_hash = %s
+              AND used_at IS NULL
+              AND expires_at > now()
+            RETURNING user_id, purpose
+        ), updated AS (
+            UPDATE users AS u
+            SET password_hash = %s,
+                account_status = CASE
+                    WHEN claimed.purpose = 'activation' THEN 'active'
+                    ELSE u.account_status
+                END,
+                activated_at = CASE
+                    WHEN claimed.purpose = 'activation' THEN now()
+                    ELSE u.activated_at
+                END
+            FROM claimed
+            WHERE u.id = claimed.user_id
+            RETURNING u.id, claimed.purpose
+        ), revoked AS (
+            DELETE FROM sessions AS s
+            USING updated
+            WHERE s.user_id = updated.id
+            RETURNING s.token
+        )
+        SELECT id, purpose FROM updated
+        """,
+        (token_hash, new_password_hash),
+    )
+    return str(row["purpose"]) if row else None
+
+
+def create_invited_user(
+    user_id: str,
+    data: dict[str, Any],
+    token_hash: str,
+    expires_at: datetime,
+) -> dict[str, Any] | None:
+    row = db.execute_returning(
+        """
+        WITH created AS (
+            INSERT INTO users (
+                id, employee_id, email, password_hash, role, position,
+                first_th, last_th, first_en, last_en, phone,
+                account_status, activated_at
+            )
+            VALUES (%s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, 'pending', NULL)
+            RETURNING id
+        ), invited AS (
+            INSERT INTO password_reset_tokens (token_hash, user_id, expires_at, purpose)
+            SELECT %s, id, %s, 'activation' FROM created
+            RETURNING user_id
+        )
+        SELECT user_id FROM invited
+        """,
+        (
+            user_id,
+            data["employee_id"],
+            data["email"],
+            data["role"],
+            data.get("position", ""),
+            data.get("first_th", ""),
+            data.get("last_th", ""),
+            data.get("first_en", ""),
+            data.get("last_en", ""),
+            data.get("phone", ""),
+            token_hash,
+            expires_at,
+        ),
+    )
+    return get_user_by_id(row["user_id"]) if row else None
 
 
 # ---------------------------------------------------------------------

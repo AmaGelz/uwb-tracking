@@ -71,27 +71,35 @@
 
   async function setupGoogleLogin() {
     const host = q('#google-btn');
-    const divider = q('.signin-divider');
     if (!host) return;
     try {
       const config = await api('/api/auth/google-config');
       if (!config?.enabled) {
-        host.hidden = true;
-        if (divider) divider.hidden = true;
+        host.setAttribute('aria-busy', 'false');
+        host.innerHTML = '<div class="google-disabled">Google Sign-In ยังไม่ได้ตั้งค่า</div>';
         return;
       }
+      const deadline = Date.now() + 8000;
+      while (!window.google?.accounts?.id && Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 100));
+      }
       if (!window.google?.accounts?.id) throw new Error('โหลด Google Sign-In ไม่สำเร็จ');
-      window.google.accounts.id.initialize({
+      const googleOptions = {
         client_id: config.client_id,
         callback: handleGoogleLogin,
         auto_select: false,
         cancel_on_tap_outside: true,
-      });
+      };
+      if (config.hosted_domain) googleOptions.hd = config.hosted_domain;
+      window.google.accounts.id.initialize(googleOptions);
+      host.replaceChildren();
+      host.setAttribute('aria-busy', 'false');
       window.google.accounts.id.renderButton(host, {
         type: 'standard', theme: 'outline', size: 'large',
         text: 'continue_with', shape: 'rectangular', width: 344,
       });
     } catch (error) {
+      host.setAttribute('aria-busy', 'false');
       host.innerHTML = `<div class="google-disabled">${escAuth(error.message || 'Google Sign-In ใช้งานไม่ได้')}</div>`;
     }
   }

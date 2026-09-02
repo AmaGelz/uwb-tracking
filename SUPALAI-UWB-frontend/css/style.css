@@ -305,6 +305,13 @@ td.dim { color: var(--muted); }
 .badge-on { background: var(--ok-bg); color: var(--ok); }
 .badge-off { background: var(--off-bg); color: var(--off); }
 .badge-none { background: #f1f3f6; color: var(--muted); }
+.badge-pending { background: var(--pending-bg); color: var(--pending); }
+
+.invite-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0 12px;
+}
 
 .deal { font-size: 12.5px; font-weight: 600; }
 .deal-won { color: var(--ok); }
@@ -427,7 +434,15 @@ td.dim { color: var(--muted); }
 .google-wrap { display: flex; justify-content: center; min-height: 44px; }
 .google-wrap > div { max-width: 100%; }
 .google-wrap .google-auth-button { width: 100%; }
-.signin-forgot { display: block; margin: 10px auto 0; }
+.signin-password-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.signin-forgot { color: var(--accent); font-size: 12.5px; text-decoration: none; }
+.signin-forgot:hover { text-decoration: underline; }
+.signin-description { margin: -10px 0 18px; color: var(--muted); font-size: 12.5px; line-height: 1.6; text-align: center; }
+.success {
+  background: var(--ok-bg); color: var(--ok);
+  font-size: 12.5px; padding: 8px 10px;
+  border-radius: var(--radius-sm); margin-bottom: 12px;
+}
 .google-disabled { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 11px 12px; text-align: center; color: var(--muted); font-size: 12px; }
 .signin-hint { margin-top: 18px; font-size: 12px; color: var(--muted); text-align: center; line-height: 1.75; }
 .err {

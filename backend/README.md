@@ -125,10 +125,49 @@ server-side (`queries.apply_scope`), not just hidden in the UI.
 
 ```env
 GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_WORKSPACE_DOMAIN=supalai.com
 ```
 
-Restart the server after changing it. Google Sign-In only logs in an
-*existing* user matched by email — it doesn't create new accounts.
+Create a Web application OAuth client in Google Cloud and add the local and
+deployed frontend URLs to Authorized JavaScript origins. Google Sign-In links
+the verified Google `sub` identifier to a pre-provisioned local user with the
+same email. It never stores the Google password. New users must be invited by
+an Admin from Dashboard -> จัดการผู้ใช้งาน.
+
+## Gmail API activation and password-reset email
+
+The sign-in page links to the password-reset flow. Set these values in
+`backend/.env` (or in the deployment's application settings):
+
+```env
+FRONTEND_BASE_URL=https://tracking.example.com
+MAIL_PROVIDER=gmail_api
+GMAIL_SENDER_EMAIL=no-reply@supalai.com
+GOOGLE_SERVICE_ACCOUNT_FILE=/run/secrets/google-service-account.json
+```
+
+For unattended Google Workspace delivery:
+
+1. Enable Gmail API in the Google Cloud project.
+2. Create a service account and enable Domain-Wide Delegation.
+3. In Google Admin Console, authorize that service account client ID for
+   `https://www.googleapis.com/auth/gmail.send`.
+4. Give the backend the JSON key through a secret file or Key Vault mount.
+   Never commit it to this repository.
+
+For a single mailbox without Domain-Wide Delegation, obtain offline OAuth
+consent and configure `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`,
+and `GMAIL_OAUTH_REFRESH_TOKEN` instead. SMTP remains available as a fallback.
+
+Run `& .\.venv\Scripts\python.exe migration\migration.py` so the identity and
+invitation migrations exist. If the
+backend uses a restricted PostgreSQL role, re-run
+`database/configure_backend_role.sql` as the table owner afterward. Reset
+links are one-time use, expire after `PASSWORD_RESET_MINUTES` (30 by default),
+and invalidate all existing sessions after a successful password change.
+
+For local development only, when `DEBUG=true` and email is not configured, the
+reset link is printed in the backend log instead of being emailed.
 
 ## Connecting real UWB hardware
 

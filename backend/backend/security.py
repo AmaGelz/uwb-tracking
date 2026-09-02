@@ -16,7 +16,9 @@ def password_hash(password: str, salt: str | None = None) -> str:
     return f"pbkdf2_sha256$120000${salt}${digest.hex()}"
 
 
-def password_verify(password: str, encoded: str) -> bool:
+def password_verify(password: str, encoded: str | None) -> bool:
+    if not encoded:
+        return False
     try:
         algorithm, iterations, salt, expected = encoded.split("$", 3)
         if algorithm != "pbkdf2_sha256":
@@ -25,6 +27,16 @@ def password_verify(password: str, encoded: str) -> bool:
         return hmac.compare_digest(digest.hex(), expected)
     except (ValueError, TypeError):
         return False
+
+
+def create_password_reset_token() -> tuple[str, str]:
+    """Return a public reset token and the SHA-256 digest stored in Postgres."""
+    token = secrets.token_urlsafe(32)
+    return token, password_reset_token_hash(token)
+
+
+def password_reset_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
@@ -39,6 +51,8 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
         "first_en": user["first_en"],
         "last_en": user["last_en"],
         "tag_id": user.get("tag_id"),
+        "account_status": user.get("account_status", "active"),
+        "google_linked": bool(user.get("google_sub")),
     }
 
 
