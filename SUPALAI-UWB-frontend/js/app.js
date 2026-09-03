@@ -774,7 +774,11 @@ async function pageVisits() {
   const [vis, heat] = await Promise.all([
     requestApi('/api/visits' + q), requestApi('/api/heatmap' + q),
   ]);
-  const peak = heat.peak || 1;
+  const heatRows = Array.isArray(heat.rows)
+    ? heat.rows.filter(row => Array.isArray(row.cells))
+    : [];
+  const heatHours = Array.isArray(heat.hours) ? heat.hours : [];
+  const peak = Number(heat.peak) || 1;
 
   render(`
     <div class="page-head"><h1>บันทึกการเยี่ยมชมโครงการ</h1>
@@ -807,14 +811,14 @@ async function pageVisits() {
           <span class="card-title">heatmap โซนที่ใช้เวลามากที่สุด ${srcTag('live')}</span>
           <span class="page-sub">แกนนอนคือชั่วโมงของวัน</span></div>
           <div class="card-body">
-            ${heat.rows.length ? `<div class="heat">
-              ${heat.rows.map(r => `<div class="heat-row">
+            ${heatRows.length && heatHours.length ? `<div class="heat">
+              ${heatRows.map(r => `<div class="heat-row">
                 <div class="bar-label">${esc(r.zone)} · ${fmtDur(r.total)}</div>
                 <div class="heat-cells">${r.cells.map(c => `
                   <div class="heat-cell" style="opacity:${(0.10 + 0.90 * (c / peak)).toFixed(3)}"
                        title="${fmtDur(c)}"></div>`).join('')}</div></div>`).join('')}
               <div class="heat-row"><div></div>
-                <div class="heat-axis">${heat.hours.map(h => `<span>${pad(h)}</span>`).join('')}</div></div>
+                <div class="heat-axis">${heatHours.map(h => `<span>${pad(h)}</span>`).join('')}</div></div>
             </div>
             <div class="heat-scale"><span>น้อย</span><span class="swatch"></span><span>มาก</span>
               <span style="margin-left:auto">สูงสุด ${fmtDur(heat.peak)} ต่อช่อง</span></div>`

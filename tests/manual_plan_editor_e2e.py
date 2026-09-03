@@ -618,6 +618,26 @@ def browser_tests(
             cdp.command("Page.enable")
             bootstrap = f"localStorage.setItem('tw_token', {json.dumps(token)});"
             cdp.command("Page.addScriptToEvaluateOnNewDocument", {"source": bootstrap})
+            if stage == "dashboard":
+                dashboard_url = f"{base_url.rstrip('/')}/dashboard.html#/visits"
+                cdp.command("Page.navigate", {"url": dashboard_url})
+                wait_until(
+                    lambda: cdp.evaluate("document.readyState === 'complete'"),
+                    "Dashboard document load",
+                    timeout=20,
+                )
+                wait_until(
+                    lambda: cdp.evaluate("Boolean(document.querySelector('.page-head h1') || document.querySelector('.err'))"),
+                    "Visits page render",
+                    timeout=25,
+                )
+                check(not cdp.evaluate("Boolean(document.querySelector('.err'))"),
+                      "Visits page renders without a route error")
+                check(not cdp.evaluate("Boolean(document.querySelector('#fatal-bar'))"),
+                      "Visits page has no unhandled JavaScript error")
+                check(cdp.evaluate("document.querySelector('.page-head h1').textContent.includes('เยี่ยมชม')"),
+                      "Visits page content is visible")
+                return
             url = f"{base_url.rstrip('/')}/plan-editor.html?plan_id={quote(plan_id)}"
             cdp.command("Page.navigate", {"url": url})
             print("INFO  browser navigated to Plan Editor", flush=True)
@@ -873,7 +893,7 @@ def main() -> int:
         default="all",
         help="run the full API suite or only the permanent data-integrity release gates",
     )
-    parser.add_argument("--browser-stage", choices=("all", "boundary", "zone"), default="all")
+    parser.add_argument("--browser-stage", choices=("all", "boundary", "zone", "dashboard"), default="all")
     args = parser.parse_args()
     if args.skip_browser and args.browser_only:
         parser.error("--skip-browser and --browser-only cannot be used together")

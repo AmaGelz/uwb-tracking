@@ -163,6 +163,9 @@ two equivalent split stages:
 ```powershell
 & .\.venv\Scripts\python.exe tests\manual_plan_editor_e2e.py --browser-only --browser-stage boundary --browser "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 & .\.venv\Scripts\python.exe tests\manual_plan_editor_e2e.py --browser-only --browser-stage zone --browser "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+& .\.venv\Scripts\python.exe tests\manual_plan_editor_e2e.py --browser-only --browser-stage dashboard --browser "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 ```
 
-The harness uses disposable `E2E-*` records and verifies cleanup at the end.
+The dashboard stage verifies that `#/visits` accepts the heatmap API contract
+without a route-level JavaScript error. The harness uses disposable `E2E-*`
+records and verifies cleanup at the end.

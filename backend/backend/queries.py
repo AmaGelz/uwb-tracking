@@ -1109,17 +1109,26 @@ def get_overview(q: dict[str, str]) -> dict[str, Any]:
 
 def get_heatmap(q: dict[str, str]) -> dict[str, Any]:
     visits = get_visits(q)
-    buckets: dict[str, int] = {}
-    for v in visits:
-        if v["start_ts"] is None:
+    hours = list(range(24))
+    buckets: dict[str, list[float]] = {}
+    for visit in visits:
+        if visit["start_ts"] is None or visit["duration"] is None:
             continue
-        dt = datetime.fromtimestamp(v["start_ts"], tz=timezone.utc)
-        key = dt.strftime("%Y-%m-%dT%H")
-        buckets[key] = buckets.get(key, 0) + 1
+        duration = max(0.0, float(visit["duration"]))
+        if duration <= 0:
+            continue
+        hour = datetime.fromtimestamp(visit["start_ts"], tz=timezone.utc).hour
+        zone = visit["top_zone"] or "outside"
+        cells = buckets.setdefault(zone, [0.0] * len(hours))
+        cells[hour] += duration
 
-    rows = [{"bucket": k, "visits": v} for k, v in sorted(buckets.items())]
-    peak = max((r["visits"] for r in rows), default=1)
-    return {"ok": True, "rows": rows, "peak": peak}
+    rows = [
+        {"zone": zone, "cells": cells, "total": sum(cells)}
+        for zone, cells in buckets.items()
+    ]
+    rows.sort(key=lambda row: (-row["total"], row["zone"]))
+    peak = max((cell for row in rows for cell in row["cells"]), default=1.0)
+    return {"ok": True, "hours": hours, "rows": rows, "peak": peak}
 
 
 def get_analytics(q: dict[str, str]) -> dict[str, Any]:
