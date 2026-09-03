@@ -856,8 +856,10 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     return detail ? json(req, detail) : fail(req, 404, "ไม่พบข้อมูลการเยี่ยมชม หรือไม่มีสิทธิ์เข้าถึง");
   }
   if (path === "/api/overview" && method === "GET") {
+    const filters = visitFilters(url, profile);
+    const projectId = filters.project || undefined;
     const [visits, anchors, tags] = await Promise.all([
-      getVisits(visitFilters(url, profile)), getAnchors(), getTags(),
+      getVisits(filters), getAnchors(projectId), getTags(projectId),
     ]);
     return json(req, overview(visits, anchors, tags, profile.role === "sale" ? "sale" : "all"));
   }

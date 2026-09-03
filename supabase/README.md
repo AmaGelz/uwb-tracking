@@ -37,7 +37,7 @@ X-Gateway-Id: GW-P900-01
 X-Gateway-Key: <shown once, at creation>
 
 {"message_id": "GW-P900-01-000123", "tag_id": "UWB-0001",
- "device_ts": 1772668800, "battery": 87,
+ "battery": 87,
  "ranges": [{"anchor_id": "A01", "distance_m": 9.85}, ...]}
 ```
 

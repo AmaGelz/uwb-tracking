@@ -229,7 +229,7 @@ create table if not exists positions (
     tag_id          text not null,
     project_id      text,
     plan_id         text,
-    source          text not null default 'hardware'
+    source          text not null default 'simulator'
                         check (source in ('hardware', 'simulator')),
     device_ts       timestamptz,
     x               double precision not null,
@@ -251,32 +251,36 @@ alter table positions
     add column if not exists anchors_used integer;
 
 -- Recover project/plan/source metadata for rows written by the legacy API.
-update positions position
-set project_id = tag.project_id
+-- One pass, not four: on Supabase this table is REPLICA IDENTITY FULL and
+-- published to Realtime, so each UPDATE ships both tuples to WAL and repeated
+-- passes rewrite every row again. Plan comes from the tag's project so the
+-- whole recovery stays a single statement.
+update positions pos
+set project_id = coalesce(pos.project_id, tag.project_id),
+    plan_id    = coalesce(pos.plan_id, project.plan_id),
+    source     = coalesce(pos.source, case
+                     when tag.tag_type = 'physical' then 'hardware'
+                     else 'simulator'
+                 end),
+    device_ts  = coalesce(pos.device_ts, pos.ts)
 from tags tag
-where position.project_id is null
-  and position.tag_id = tag.tag_id;
+left join projects project on project.id = tag.project_id
+where pos.tag_id = tag.tag_id
+  and (pos.project_id is null or pos.plan_id is null
+       or pos.source is null or pos.device_ts is null);
 
-update positions position
-set plan_id = project.plan_id
-from projects project
-where position.plan_id is null
-  and position.project_id = project.id;
+-- Rows whose tag has since been deleted predate hardware support entirely,
+-- so they are simulator history.
+update positions
+set source    = coalesce(source, 'simulator'),
+    device_ts = coalesce(device_ts, ts)
+where source is null or device_ts is null;
 
-update positions position
-set source = case
-    when tag.tag_type = 'physical' then 'hardware'
-    else 'simulator'
-end
-from tags tag
-where position.source is null
-  and position.tag_id = tag.tag_id;
-
-update positions set source = 'hardware' where source is null;
-update positions set device_ts = ts where device_ts is null;
-
+-- Default 'simulator', not 'hardware': every writer aware of hardware sets
+-- source explicitly, so the default is only ever reached by older code paths,
+-- all of which are simulated.
 alter table positions
-    alter column source set default 'hardware',
+    alter column source set default 'simulator',
     alter column source set not null;
 
 do $$
@@ -341,7 +345,7 @@ create table if not exists visits (
     duration_sec    integer default 0,
     zone            text,
     deal_status     text default '',
-    source          text not null default 'hardware'
+    source          text not null default 'simulator'
                         check (source in ('hardware', 'simulator'))
 );
 
@@ -359,10 +363,11 @@ from tags tag
 where visit.source is null
   and visit.tag_id = tag.tag_id;
 
-update visits set source = 'hardware' where source is null;
+-- Same as positions: a visit whose tag is gone predates hardware support.
+update visits set source = 'simulator' where source is null;
 
 alter table visits
-    alter column source set default 'hardware',
+    alter column source set default 'simulator',
     alter column source set not null;
 
 do $$

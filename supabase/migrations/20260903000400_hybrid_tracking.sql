@@ -145,32 +145,42 @@ ALTER TABLE public.positions
     ADD COLUMN IF NOT EXISTS anchors_used integer;
 
 -- Recover project/plan/source metadata for rows written by the legacy API.
-UPDATE public.positions position
-SET project_id = tag.project_id
+--
+-- Done in a single pass on purpose. `positions` is REPLICA IDENTITY FULL and a
+-- member of the supabase_realtime publication (see …000300), so every UPDATE
+-- writes both the old and the new tuple to WAL for Realtime to decode. Four
+-- sequential passes over a large table would rewrite every row four times,
+-- bloating the table and flooding the replication slot inside a single
+-- transaction. Plan comes from the tag's project rather than from the row's
+-- freshly written project_id so the whole thing stays one statement.
+UPDATE public.positions pos
+SET project_id = COALESCE(pos.project_id, tag.project_id),
+    plan_id    = COALESCE(pos.plan_id, project.plan_id),
+    source     = COALESCE(pos.source, CASE
+                     WHEN tag.tag_type = 'physical' THEN 'hardware'
+                     ELSE 'simulator'
+                 END),
+    device_ts  = COALESCE(pos.device_ts, pos.ts)
 FROM public.tags tag
-WHERE position.project_id IS NULL
-  AND position.tag_id = tag.tag_id;
+LEFT JOIN public.projects project ON project.id = tag.project_id
+WHERE pos.tag_id = tag.tag_id
+  AND (pos.project_id IS NULL OR pos.plan_id IS NULL
+       OR pos.source IS NULL OR pos.device_ts IS NULL);
 
-UPDATE public.positions position
-SET plan_id = project.plan_id
-FROM public.projects project
-WHERE position.plan_id IS NULL
-  AND position.project_id = project.id;
+-- Rows whose tag has since been deleted keep no project, and predate hardware
+-- support entirely, so they are simulator history.
+UPDATE public.positions
+SET source    = COALESCE(source, 'simulator'),
+    device_ts = COALESCE(device_ts, ts)
+WHERE source IS NULL OR device_ts IS NULL;
 
-UPDATE public.positions position
-SET source = CASE
-    WHEN tag.tag_type = 'physical' THEN 'hardware'
-    ELSE 'simulator'
-END
-FROM public.tags tag
-WHERE position.source IS NULL
-  AND position.tag_id = tag.tag_id;
-
-UPDATE public.positions SET source = 'hardware' WHERE source IS NULL;
-UPDATE public.positions SET device_ts = ts WHERE device_ts IS NULL;
-
+-- Default 'simulator', not 'hardware': every writer that knows about hardware
+-- sets source explicitly (the RPC writes 'hardware', the mock path and the
+-- FastAPI ingest write theirs). The only writers that fall back to the default
+-- are the previously deployed API, FastAPI and its simulator — which is
+-- exactly the traffic arriving between this migration and the function deploy.
 ALTER TABLE public.positions
-    ALTER COLUMN source SET DEFAULT 'hardware',
+    ALTER COLUMN source SET DEFAULT 'simulator',
     ALTER COLUMN source SET NOT NULL;
 
 DO $$
@@ -230,10 +240,11 @@ FROM public.tags tag
 WHERE visit.source IS NULL
   AND visit.tag_id = tag.tag_id;
 
-UPDATE public.visits SET source = 'hardware' WHERE source IS NULL;
+-- Same as positions: a visit whose tag is gone predates hardware support.
+UPDATE public.visits SET source = 'simulator' WHERE source IS NULL;
 
 ALTER TABLE public.visits
-    ALTER COLUMN source SET DEFAULT 'hardware',
+    ALTER COLUMN source SET DEFAULT 'simulator',
     ALTER COLUMN source SET NOT NULL;
 
 DO $$
@@ -520,5 +531,28 @@ ALTER TABLE public.gateway_credentials ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tag_assignments_read_authenticated ON public.tag_assignments;
 CREATE POLICY tag_assignments_read_authenticated ON public.tag_assignments
 FOR SELECT TO authenticated USING (auth.uid() IS NOT NULL);
+
+-- A policy alone is not enough: …000300 grants table privileges one table at a
+-- time ("Explicit grants are required by current Supabase projects before RLS
+-- can be evaluated through the Data API"), and its ALL SEQUENCES grant ran
+-- before this table existed. Without the grant below the policy above is dead
+-- code. gateway_credentials is deliberately left ungranted to authenticated —
+-- no policy, no privilege, so key hashes stay service-role-only.
+GRANT SELECT ON public.tag_assignments TO authenticated;
+GRANT USAGE, SELECT ON SEQUENCE public.tag_assignments_id_seq TO authenticated;
+
+-- service_role reaches migration-created tables through this project's default
+-- privileges (the deployed api function already relies on that for the tables
+-- from …000100). Granting explicitly is redundant there but costs nothing, and
+-- it keeps a project whose defaults do not auto-expose new tables from failing
+-- every gateway route with "permission denied".
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON public.tag_assignments, public.gateway_credentials TO service_role';
+        EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE public.tag_assignments_id_seq TO service_role';
+    END IF;
+END
+$$;
 
 COMMIT;

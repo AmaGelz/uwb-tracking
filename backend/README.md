@@ -149,7 +149,6 @@ X-Gateway-Key: <the key from step 2>
 {
   "message_id": "GW-P900-01-000123",
   "tag_id": "UWB-0001",
-  "device_ts": 1772668800,
   "battery": 87,
   "ranges": [
     {"anchor_id": "A01", "distance_m": 9.85},
@@ -170,9 +169,10 @@ X-Gateway-Key: <the key from step 2>
 - `message_id` makes retries safe: re-posting the same
   `(gateway_id, message_id)` returns the original fix with
   `"duplicate": true` instead of recording it twice or reopening a visit.
-- `device_ts` accepts epoch seconds or ISO-8601 and is rejected if it is
-  more than 5 minutes in the future or 15 minutes old — a broken clock or
-  a replay is not a live position.
+- Optional `device_ts` accepts current epoch seconds or ISO-8601; when omitted,
+  server receipt time is used. It is rejected if it is more than 5 minutes in
+  the future or 15 minutes old — a broken clock or a replay is not a live
+  position.
 
 ### Bench-testing without hardware
 
