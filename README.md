@@ -149,11 +149,21 @@ this project doesn't currently specify. In the meantime:
 - A background simulator (`backend/backend/simulator.py`) moves the
   seeded demo tags around the floor plan so the live map, visit
   history, and analytics all have real data to look at.
-- Real anchors/tags can be wired in later without any other backend
-  changes — point their ranging output at
-  `POST /api/positioning/{project_id}/ingest`, which runs through the
-  same code path the simulator uses. See `backend/README.md` →
-  "Connecting real UWB hardware".
+- Real hardware can be added per project, alongside the demo data,
+  without turning the simulator off globally. Every tag is registered
+  as `physical` or `mock` and every project as `hardware`,
+  `simulation`, or `disabled`; the simulator only moves mock tags in
+  simulation projects, and a gateway can only report physical tags in
+  hardware projects. Registering a physical tag (or a gateway key)
+  switches that one project to hardware mode.
+- Gateways authenticate with a project-scoped key issued from the
+  **จัดการแท็กและอุปกรณ์** admin page — shown once, stored only as a
+  SHA-256 digest — and post to `POST /api/uwb/ingest` (FastAPI) or the
+  `uwb-ingest` Edge Function (Supabase). Both paths solve the position
+  with the same multilateration code, deduplicate retries by
+  `message_id`, and keep the visit lifecycle in sync. See
+  `backend/README.md` → "Real hardware and simulated demo data side by
+  side".
 
 ## `data/config/*.json`
 

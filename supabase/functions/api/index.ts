@@ -19,6 +19,12 @@ const DEAL_STATUSES = [WON, LOST];
 
 type Profile = Record<string, any>;
 
+const TAG_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
+const HARDWARE_UID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const TAG_TYPES = new Set(["physical", "mock"]);
+const TAG_STATUSES = new Set(["active", "disabled"]);
+const TRACKING_MODES = new Set(["hardware", "simulation", "disabled"]);
+
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") ?? "";
   return {
@@ -26,7 +32,7 @@ function corsHeaders(req: Request): Record<string, string> {
       ? origin
       : "https://supalai-uwb-tracking.ordinary-plant.workers.dev",
     "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
     "Vary": "Origin",
   };
 }
@@ -43,7 +49,12 @@ function fail(req: Request, status: number, detail: string): Response {
 }
 
 function unwrap<T>(result: { data: T; error: any }): T {
-  if (result.error) throw new Error(result.error.message);
+  if (result.error) {
+    const error: any = new Error(result.error.message);
+    error.code = result.error.code;
+    error.details = result.error.details;
+    throw error;
+  }
   return result.data;
 }
 
@@ -100,6 +111,129 @@ async function body(req: Request): Promise<Record<string, any>> {
   }
 }
 
+class HttpError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function cleanIdentifier(value: unknown, field: string, pattern = TAG_ID_PATTERN): string {
+  const result = String(value ?? "").trim();
+  if (!pattern.test(result)) throw new HttpError(422, `${field} is invalid`);
+  return result;
+}
+
+function cleanNullableText(value: unknown, maxLength = 200): string | null {
+  if (value === null || value === undefined) return null;
+  const result = String(value).trim();
+  if (!result) return null;
+  if (result.length > maxLength) throw new HttpError(422, `Value must not exceed ${maxLength} characters`);
+  return result;
+}
+
+function randomGatewayKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const binary = String.fromCharCode(...bytes);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function projectForAssignment(projectId: string, tagType: string): Promise<Profile> {
+  const project = unwrap<any>(await db
+    .from("projects")
+    .select("id,name,tracking_mode")
+    .eq("id", projectId)
+    .maybeSingle());
+  if (!project) throw new HttpError(404, "Project not found");
+  if (project.tracking_mode === "disabled") throw new HttpError(409, "Tracking is disabled for this project");
+  if (tagType === "physical" && project.tracking_mode !== "hardware") {
+    project.tracking_mode = "hardware";
+    unwrap(await db.from("projects").update({ tracking_mode: "hardware" }).eq("id", projectId));
+  }
+  if (tagType === "mock" && project.tracking_mode === "hardware") {
+    throw new HttpError(409, "Mock tags cannot be assigned to a hardware project");
+  }
+  return project;
+}
+
+async function employeeExists(employeeId: string | null): Promise<void> {
+  if (!employeeId) return;
+  const employee = unwrap<any>(await db
+    .from("users")
+    .select("employee_id")
+    .eq("employee_id", employeeId)
+    .maybeSingle());
+  if (!employee) throw new HttpError(404, "Employee not found");
+}
+
+async function closeOpenVisits(tagId: string, endedAt: string): Promise<void> {
+  const visits = unwrap<any[]>(await db
+    .from("visits")
+    .select("visit_key,started_at")
+    .eq("tag_id", tagId)
+    .is("ended_at", null));
+  for (const visit of visits) {
+    const start = Date.parse(visit.started_at);
+    const end = Date.parse(endedAt);
+    const duration = Number.isFinite(start) && Number.isFinite(end)
+      ? Math.max(0, Math.round((end - start) / 1000))
+      : 0;
+    unwrap(await db.from("visits").update({ ended_at: endedAt, duration_sec: duration }).eq("visit_key", visit.visit_key));
+  }
+}
+
+async function syncLegacyUserTag(tagId: string, employeeId: string | null): Promise<void> {
+  unwrap(await db.from("users").update({ tag_id: null }).eq("tag_id", tagId));
+  if (employeeId) unwrap(await db.from("users").update({ tag_id: tagId }).eq("employee_id", employeeId));
+}
+
+async function assignTag(
+  tagId: string,
+  projectId: string,
+  employeeId: string | null,
+  assignedBy: string,
+): Promise<Profile> {
+  const tag = unwrap<any>(await db.from("tags").select("*").eq("tag_id", tagId).maybeSingle());
+  if (!tag) throw new HttpError(404, "Tag not found");
+  await Promise.all([projectForAssignment(projectId, tag.tag_type), employeeExists(employeeId)]);
+
+  const current = unwrap<any>(await db
+    .from("tag_assignments")
+    .select("id,project_id,employee_id,assigned_at")
+    .eq("tag_id", tagId)
+    .is("ended_at", null)
+    .maybeSingle());
+  if (current?.project_id === projectId && (current.employee_id ?? null) === employeeId) return current;
+
+  const now = new Date().toISOString();
+  await closeOpenVisits(tagId, now);
+  unwrap(await db.from("tag_assignments").update({ ended_at: now }).eq("tag_id", tagId).is("ended_at", null));
+  const assignment = unwrap<any>(await db.from("tag_assignments").insert({
+    tag_id: tagId,
+    project_id: projectId,
+    employee_id: employeeId,
+    assigned_at: now,
+    assigned_by: assignedBy,
+  }).select().single());
+  unwrap(await db.from("tags").update({
+    project_id: projectId,
+    employee_id: employeeId,
+    x: null,
+    y: null,
+    last_ts: null,
+    updated_at: now,
+  }).eq("tag_id", tagId));
+  await syncLegacyUserTag(tagId, employeeId);
+  return assignment;
+}
+
 async function getPlans(projectId?: string): Promise<Profile[]> {
   let query = db.from("plans").select("*").order("is_active", { ascending: false }).order("name");
   if (projectId) query = query.eq("project_id", projectId);
@@ -152,29 +286,48 @@ async function getAnchors(projectId?: string, planId?: string): Promise<Profile[
 async function getTags(projectId?: string): Promise<Profile[]> {
   let query = db.from("tags").select("*").order("tag_id");
   if (projectId) query = query.eq("project_id", projectId);
-  const [tags, users] = await Promise.all([
+  let assignmentQuery = db
+    .from("tag_assignments")
+    .select("id,tag_id,project_id,employee_id,assigned_at")
+    .is("ended_at", null);
+  if (projectId) assignmentQuery = assignmentQuery.eq("project_id", projectId);
+  const [tags, users, assignments] = await Promise.all([
     query.then((result: any) => unwrap<any[]>(result)),
     db.from("users").select("employee_id,first_en,last_en").then((result: any) => unwrap<any[]>(result)),
+    assignmentQuery.then((result: any) => unwrap<any[]>(result)),
   ]);
   const userByEmployee = new Map(users.map((user) => [user.employee_id, user]));
+  const assignmentByTag = new Map(assignments.map((assignment) => [assignment.tag_id, assignment]));
   return tags.map(({ id: _id, ...tag }) => {
-    const user = userByEmployee.get(tag.employee_id);
+    const assignment = assignmentByTag.get(tag.tag_id);
+    const employeeId = assignment?.employee_id ?? tag.employee_id ?? null;
+    const effectiveProjectId = assignment?.project_id ?? tag.project_id ?? null;
+    const user = userByEmployee.get(employeeId);
+    const on = tag.status === "active" && isOnline(tag.last_ts, 5);
     return {
       ...tag,
+      project_id: effectiveProjectId,
+      employee_id: employeeId,
+      assignment_id: assignment?.id ?? null,
+      assigned_at: assignment ? epoch(assignment.assigned_at) : null,
       sale_name: user ? `${user.first_en} ${user.last_en}`.trim() : null,
-      on: isOnline(tag.last_ts, 5),
+      on,
+      signal_status: tag.status === "disabled" ? "disabled" : !tag.last_ts ? "waiting" : on ? "online" : "offline",
       last_ts: epoch(tag.last_ts),
     };
   });
 }
 
-async function getLive(rows = 400, since = 0): Promise<Profile> {
-  const tags = await getTags();
+async function getLive(rows = 400, since = 0, projectId?: string): Promise<Profile> {
+  const tags = await getTags(projectId);
   const tagMap = Object.fromEntries(tags.map((tag) => [tag.tag_id, {
     x: tag.x,
     y: tag.y,
     battery: tag.battery,
     on: tag.on,
+    status: tag.signal_status,
+    tag_type: tag.tag_type,
+    project_id: tag.project_id,
     sale_name: tag.sale_name,
     last_ts: tag.last_ts,
   }]));
@@ -186,6 +339,7 @@ async function getLive(rows = 400, since = 0): Promise<Profile> {
       .select("tag_id,x,y,zone,ts")
       .order("ts", { ascending: false })
       .limit(Math.min(Math.max(rows, 1), 5000));
+    if (projectId) query = query.eq("project_id", projectId);
     if (since > 0) query = query.gt("ts", new Date(since * 1000).toISOString());
     trail = unwrap<any[]>(await query).map((position) => ({ ...position, ts: epoch(position.ts) }));
   }
@@ -563,12 +717,135 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     });
   }
 
+  if (path === "/api/tags" && method === "GET") {
+    const projectId = cleanNullableText(url.searchParams.get("project_id"), 100) ?? undefined;
+    return json(req, { ok: true, tags: await getTags(projectId) });
+  }
+  if (path === "/api/tags" && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const payload = await body(req);
+    const tagId = cleanIdentifier(payload.tag_id, "Tag ID");
+    const tagType = String(payload.tag_type ?? "physical").trim().toLowerCase();
+    const status = String(payload.status ?? "active").trim().toLowerCase();
+    const hardwareUid = cleanNullableText(payload.hardware_uid, 200);
+    const label = cleanNullableText(payload.label, 200) ?? tagId;
+    const projectId = payload.project_id == null || payload.project_id === ""
+      ? null
+      : cleanIdentifier(payload.project_id, "Project ID");
+    const employeeId = payload.employee_id == null || payload.employee_id === ""
+      ? null
+      : cleanIdentifier(payload.employee_id, "Employee ID");
+    if (!TAG_TYPES.has(tagType)) return fail(req, 422, "tag_type must be physical or mock");
+    if (!TAG_STATUSES.has(status)) return fail(req, 422, "status must be active or disabled");
+    if (hardwareUid && !HARDWARE_UID_PATTERN.test(hardwareUid)) return fail(req, 422, "Hardware UID is invalid");
+    const duplicate = unwrap<any>(await db.from("tags").select("tag_id").eq("tag_id", tagId).maybeSingle());
+    if (duplicate) return fail(req, 409, "Tag ID already exists");
+    if (hardwareUid) {
+      const duplicateUid = unwrap<any>(await db.from("tags").select("tag_id").eq("hardware_uid", hardwareUid).maybeSingle());
+      if (duplicateUid) return fail(req, 409, "Hardware UID already exists");
+    }
+    if (projectId) await Promise.all([projectForAssignment(projectId, tagType), employeeExists(employeeId)]);
+    else await employeeExists(employeeId);
+    const now = new Date().toISOString();
+    unwrap(await db.from("tags").insert({
+      tag_id: tagId,
+      hardware_uid: hardwareUid,
+      label,
+      tag_type: tagType,
+      status,
+      project_id: projectId,
+      employee_id: employeeId,
+      created_at: now,
+      updated_at: now,
+    }));
+    if (projectId) await assignTag(tagId, projectId, employeeId, profile.id);
+    const created = (await getTags(projectId ?? undefined)).find((tag) => tag.tag_id === tagId);
+    return json(req, { ok: true, tag: created }, 201);
+  }
+
+  let tagMatch = path.match(/^\/api\/tags\/([^/]+)$/);
+  if (tagMatch && method === "GET") {
+    const tagId = decodeURIComponent(tagMatch[1]);
+    const tag = (await getTags()).find((item) => item.tag_id === tagId);
+    return tag ? json(req, { ok: true, tag }) : fail(req, 404, "Tag not found");
+  }
+  if (tagMatch && (method === "PATCH" || method === "PUT")) {
+    requireRole(profile, ["admin"]);
+    const tagId = decodeURIComponent(tagMatch[1]);
+    const existing = unwrap<any>(await db.from("tags").select("*").eq("tag_id", tagId).maybeSingle());
+    if (!existing) return fail(req, 404, "Tag not found");
+    const payload = await body(req);
+    const changes: Profile = {};
+    if (payload.label !== undefined) changes.label = cleanNullableText(payload.label, 200) ?? tagId;
+    if (payload.hardware_uid !== undefined) {
+      const hardwareUid = cleanNullableText(payload.hardware_uid, 200);
+      if (hardwareUid && !HARDWARE_UID_PATTERN.test(hardwareUid)) return fail(req, 422, "Hardware UID is invalid");
+      if (hardwareUid) {
+        const duplicateUid = unwrap<any>(await db.from("tags").select("tag_id").eq("hardware_uid", hardwareUid).neq("tag_id", tagId).maybeSingle());
+        if (duplicateUid) return fail(req, 409, "Hardware UID already exists");
+      }
+      changes.hardware_uid = hardwareUid;
+    }
+    if (payload.tag_type !== undefined) {
+      const tagType = String(payload.tag_type).trim().toLowerCase();
+      if (!TAG_TYPES.has(tagType)) return fail(req, 422, "tag_type must be physical or mock");
+      changes.tag_type = tagType;
+      if (existing.project_id) await projectForAssignment(existing.project_id, tagType);
+    }
+    if (payload.status !== undefined) {
+      const status = String(payload.status).trim().toLowerCase();
+      if (!TAG_STATUSES.has(status)) return fail(req, 422, "status must be active or disabled");
+      changes.status = status;
+      if (status === "disabled") {
+        const now = new Date().toISOString();
+        await closeOpenVisits(tagId, now);
+        changes.x = null;
+        changes.y = null;
+        changes.last_ts = null;
+      }
+    }
+    if (!Object.keys(changes).length) return fail(req, 400, "No supported tag fields were provided");
+    changes.updated_at = new Date().toISOString();
+    unwrap(await db.from("tags").update(changes).eq("tag_id", tagId));
+    const updated = (await getTags()).find((tag) => tag.tag_id === tagId);
+    return json(req, { ok: true, tag: updated });
+  }
+
+  tagMatch = path.match(/^\/api\/tags\/([^/]+)\/assign$/);
+  if (tagMatch && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const tagId = decodeURIComponent(tagMatch[1]);
+    const payload = await body(req);
+    const projectId = cleanIdentifier(payload.project_id, "Project ID");
+    const employeeId = payload.employee_id == null || payload.employee_id === ""
+      ? null
+      : cleanIdentifier(payload.employee_id, "Employee ID");
+    const assignment = await assignTag(tagId, projectId, employeeId, profile.id);
+    const tag = (await getTags(projectId)).find((item) => item.tag_id === tagId);
+    return json(req, { ok: true, assignment, tag });
+  }
+
+  tagMatch = path.match(/^\/api\/tags\/([^/]+)\/deactivate$/);
+  if (tagMatch && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const tagId = decodeURIComponent(tagMatch[1]);
+    const existing = unwrap<any>(await db.from("tags").select("tag_id").eq("tag_id", tagId).maybeSingle());
+    if (!existing) return fail(req, 404, "Tag not found");
+    const now = new Date().toISOString();
+    await closeOpenVisits(tagId, now);
+    unwrap(await db.from("tags").update({ status: "disabled", x: null, y: null, last_ts: null, updated_at: now }).eq("tag_id", tagId));
+    const tag = (await getTags()).find((item) => item.tag_id === tagId);
+    return json(req, { ok: true, tag });
+  }
+
   if (path === "/api/devices" && method === "GET") {
-    const [anchors, tags] = await Promise.all([getAnchors(), getTags()]);
+    const projectId = cleanNullableText(url.searchParams.get("project_id"), 100) ?? undefined;
+    const [anchors, tags] = await Promise.all([getAnchors(projectId), getTags(projectId)]);
     return json(req, { ok: true, anchors, tags });
   }
   if (path === "/api/live" && method === "GET") {
-    return json(req, await getLive(Number(url.searchParams.get("rows") ?? 400), Number(url.searchParams.get("since") ?? 0)));
+    const projectId = cleanNullableText(url.searchParams.get("project_id"), 100) ?? undefined;
+    return json(req, await getLive(Number(url.searchParams.get("rows") ?? 400), Number(url.searchParams.get("since") ?? 0), projectId));
   }
   if (path === "/api/visits" && method === "GET") {
     const filters = visitFilters(url, profile);
@@ -608,10 +885,15 @@ async function route(req: Request, profile: Profile): Promise<Response> {
   if (path === "/api/projects" && method === "POST") {
     requireRole(profile, ["admin"]);
     const payload = await body(req);
+    const trackingMode = String(payload.tracking_mode ?? "simulation").trim().toLowerCase();
+    if (!TRACKING_MODES.has(trackingMode)) {
+      return fail(req, 422, "tracking_mode must be hardware, simulation, or disabled");
+    }
     unwrap(await db.from("projects").insert({
       id: payload.project_id, name: payload.name, province: payload.province || "",
       plan_id: payload.plan_id || "", plan_name: payload.plan_name || "",
       width_m: payload.width_m || 20, height_m: payload.height_m || 20,
+      tracking_mode: trackingMode,
     }));
     return json(req, { ok: true, project: (await getProjects()).find((item) => item.project_id === payload.project_id) });
   }
@@ -622,6 +904,96 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     const project = (await getProjects()).find((item) => item.project_id === projectId);
     if (!project) return fail(req, 404, "ไม่พบโครงการ");
     return json(req, { ...project, anchors: await getAnchors(projectId), zones: unwrap(await db.from("zones").select("name,x_min,x_max,y_min,y_max").eq("project_id", projectId).order("id")) });
+  }
+
+  match = path.match(/^\/api\/projects\/([^/]+)\/tracking-mode$/);
+  if (match && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const projectId = decodeURIComponent(match[1]);
+    const payload = await body(req);
+    const trackingMode = String(payload.tracking_mode ?? "").trim().toLowerCase();
+    if (!TRACKING_MODES.has(trackingMode)) {
+      return fail(req, 422, "tracking_mode must be hardware, simulation, or disabled");
+    }
+    const project = unwrap<any>(await db.from("projects").select("id").eq("id", projectId).maybeSingle());
+    if (!project) return fail(req, 404, "ไม่พบโครงการ");
+    // Leaving hardware mode would hand the project's real tags to the
+    // simulator, so they have to be moved or disabled first.
+    if (trackingMode !== "hardware") {
+      const physical = unwrap<any[]>(await db
+        .from("tags")
+        .select("tag_id")
+        .eq("project_id", projectId)
+        .eq("tag_type", "physical")
+        .eq("status", "active"));
+      if (physical.length) {
+        return fail(
+          req,
+          409,
+          `ยังมีแท็กอุปกรณ์จริงในโครงการนี้ กรุณาย้ายหรือปิดใช้งานก่อน (${physical.map((tag) => tag.tag_id).join(", ")})`,
+        );
+      }
+    }
+    unwrap(await db.from("projects").update({ tracking_mode: trackingMode }).eq("id", projectId));
+    return json(req, { ok: true, project: (await getProjects()).find((item) => item.project_id === projectId) });
+  }
+
+  match = path.match(/^\/api\/projects\/([^/]+)\/gateways$/);
+  if (match && method === "GET") {
+    requireRole(profile, ["admin"]);
+    const projectId = decodeURIComponent(match[1]);
+    const gateways = unwrap<any[]>(await db
+      .from("gateway_credentials")
+      .select("gateway_id,project_id,status,last_seen_at,created_at,updated_at")
+      .eq("project_id", projectId)
+      .order("gateway_id"));
+    return json(req, { ok: true, gateways });
+  }
+  if (match && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const projectId = decodeURIComponent(match[1]);
+    const payload = await body(req);
+    const gatewayId = payload.gateway_id == null || payload.gateway_id === ""
+      ? `GW-${crypto.randomUUID().slice(0, 8).toUpperCase()}`
+      : cleanIdentifier(payload.gateway_id, "Gateway ID");
+    const project = unwrap<any>(await db.from("projects").select("id,tracking_mode").eq("id", projectId).maybeSingle());
+    if (!project) return fail(req, 404, "Project not found");
+    const duplicate = unwrap<any>(await db.from("gateway_credentials").select("gateway_id").eq("gateway_id", gatewayId).maybeSingle());
+    if (duplicate) return fail(req, 409, "Gateway ID already exists");
+    const gatewayKey = randomGatewayKey();
+    const now = new Date().toISOString();
+    const inserted = unwrap<any>(await db.from("gateway_credentials").insert({
+      gateway_id: gatewayId,
+      project_id: projectId,
+      key_hash: await sha256Hex(gatewayKey),
+      status: "active",
+      created_at: now,
+      updated_at: now,
+    }).select("gateway_id,project_id,status,last_seen_at,created_at,updated_at").single());
+    if (project.tracking_mode !== "hardware") {
+      unwrap(await db.from("projects").update({ tracking_mode: "hardware" }).eq("id", projectId));
+    }
+    return json(req, {
+      ok: true,
+      gateway: inserted,
+      gateway_key: gatewayKey,
+      warning: "Copy this key now. It will not be shown again.",
+    }, 201);
+  }
+
+  match = path.match(/^\/api\/projects\/([^/]+)\/gateways\/([^/]+)\/revoke$/);
+  if (match && method === "POST") {
+    requireRole(profile, ["admin"]);
+    const projectId = decodeURIComponent(match[1]);
+    const gatewayId = decodeURIComponent(match[2]);
+    const updated = unwrap<any>(await db.from("gateway_credentials")
+      .update({ status: "revoked", updated_at: new Date().toISOString() })
+      .eq("project_id", projectId)
+      .eq("gateway_id", gatewayId)
+      .select("gateway_id,project_id,status,last_seen_at,created_at,updated_at")
+      .maybeSingle());
+    if (!updated) return fail(req, 404, "Gateway not found");
+    return json(req, { ok: true, gateway: updated });
   }
 
   match = path.match(/^\/api\/projects\/([^/]+)\/plans$/);
@@ -787,17 +1159,49 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     return json(req, { ok: true, coverage_radius_m: Number(payload.coverage_radius_m || 10), anchors: payload.anchors, ...coverage(payload) });
   }
 
-  match = path.match(/^\/api\/positioning\/([^/]+)$/);
+  match = path.match(/^\/api\/positioning\/([^/]+)(?:\/ingest)?$/);
   if (match && method === "GET") {
-    const live = await getLive(0);
+    const live = await getLive(0, 0, decodeURIComponent(match[1]));
     return json(req, { ok: true, project_id: decodeURIComponent(match[1]), tags: live.tags });
   }
   if (match && method === "POST") {
+    requireRole(profile, ["admin"]);
     const projectId = decodeURIComponent(match[1]);
     const payload = await body(req);
-    const anchors = await getAnchors(projectId);
+    const project = unwrap<any>(await db
+      .from("projects")
+      .select("id,plan_id,tracking_mode")
+      .eq("id", projectId)
+      .maybeSingle());
+    if (!project) return fail(req, 404, "Project not found");
+    if (project.tracking_mode !== "simulation") {
+      return fail(req, 403, "Authenticated positioning only accepts mock tags; hardware must use uwb-ingest");
+    }
+    const tagId = cleanIdentifier(payload.tag_id, "Tag ID");
+    const tag = unwrap<any>(await db.from("tags").select("*").eq("tag_id", tagId).maybeSingle());
+    if (!tag) return fail(req, 404, "Tag not found");
+    if (tag.tag_type !== "mock" || tag.status !== "active") {
+      return fail(req, 403, "This endpoint accepts active mock tags only");
+    }
+    const assignment = unwrap<any>(await db
+      .from("tag_assignments")
+      .select("employee_id")
+      .eq("tag_id", tagId)
+      .eq("project_id", projectId)
+      .is("ended_at", null)
+      .maybeSingle());
+    if (!assignment) return fail(req, 409, "Tag is not actively assigned to this project");
+    const anchors = await getAnchors(projectId, project.plan_id || undefined);
     const anchorMap = new Map(anchors.map((anchor) => [anchor.anchor_id, anchor]));
-    const known = (payload.ranges || []).map((range: Profile) => ({ anchor: anchorMap.get(range.anchor_id), distance: Number(range.distance_m) })).filter((item: any) => item.anchor && item.distance > 0);
+    const ranges = Array.isArray(payload.ranges) ? payload.ranges : [];
+    const seenAnchors = new Set<string>();
+    const known = ranges.map((range: Profile) => {
+      const anchorId = String(range.anchor_id ?? "").trim();
+      const distance = Number(range.distance_m);
+      if (!anchorId || seenAnchors.has(anchorId) || !Number.isFinite(distance) || distance <= 0) return null;
+      seenAnchors.add(anchorId);
+      return { anchor: anchorMap.get(anchorId), distance };
+    }).filter((item: any) => item?.anchor);
     if (known.length < 3) return fail(req, 400, "ต้องมีระยะจาก anchor ที่รู้จักอย่างน้อย 3 จุด");
     const reference = known[known.length - 1];
     let aa = 0, ab = 0, bb = 0, ac = 0, bc = 0;
@@ -812,20 +1216,37 @@ async function route(req: Request, profile: Profile): Promise<Response> {
     const x = (ac * bb - bc * ab) / determinant;
     const y = (bc * aa - ac * ab) / determinant;
     const residual = Math.sqrt(known.reduce((sum: number, item: any) => sum + (Math.hypot(item.anchor.x - x, item.anchor.y - y) - item.distance) ** 2, 0) / known.length);
-    const zones = unwrap<any[]>(await db.from("zones").select("name,x_min,x_max,y_min,y_max").eq("project_id", projectId));
+    const zones = unwrap<any[]>(await db.from("zones").select("name,x_min,x_max,y_min,y_max").eq("project_id", projectId).eq("plan_id", project.plan_id));
     const zone = zones.find((item) => item.x_min <= x && x <= item.x_max && item.y_min <= y && y <= item.y_max)?.name ?? null;
-    const now = new Date().toISOString();
-    const tag = unwrap<any>(await db.from("tags").select("*").eq("tag_id", payload.tag_id).maybeSingle());
-    if (!tag) return fail(req, 404, "ไม่พบ tag");
-    unwrap(await db.from("positions").insert({ tag_id: payload.tag_id, x, y, zone, ts: now }));
-    unwrap(await db.from("tags").update({ x, y, last_ts: now }).eq("tag_id", payload.tag_id));
-    const openVisit = unwrap<any>(await db.from("visits").select("visit_key").eq("tag_id", payload.tag_id).is("ended_at", null).order("started_at", { ascending: false }).limit(1).maybeSingle());
-    if (!openVisit) {
-      const project = unwrap<any>(await db.from("projects").select("plan_id").eq("id", projectId).single());
-      const visitKey = `V-${Math.floor(Date.now() / 1000)}-${payload.tag_id}-${crypto.randomUUID().slice(0, 6)}`;
-      unwrap(await db.from("visits").insert({ visit_key: visitKey, tag_id: payload.tag_id, employee_id: tag.employee_id, project_id: projectId, plan_id: project.plan_id, started_at: now, deal_status: "" }));
+    const suppliedTs = Date.parse(String(payload.measured_at ?? payload.device_ts ?? ""));
+    const measuredAt = Number.isFinite(suppliedTs) ? new Date(suppliedTs).toISOString() : new Date().toISOString();
+    const messageId = cleanNullableText(payload.message_id, 128) ?? `sim-${crypto.randomUUID()}`;
+    const battery = payload.battery_pct == null && payload.battery == null ? tag.battery : Number(payload.battery_pct ?? payload.battery);
+    if (battery != null && (!Number.isFinite(battery) || battery < 0 || battery > 100)) {
+      return fail(req, 422, "Battery must be between 0 and 100");
     }
-    return json(req, { ok: true, tag_id: payload.tag_id, x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000, zone, residual_m: Math.round(residual * 10000) / 10000, anchors_used: known.length, ts: Date.now() / 1000 });
+    if (!tag) return fail(req, 404, "ไม่พบ tag");
+    unwrap(await db.from("positions").insert({
+      tag_id: tagId,
+      project_id: projectId,
+      plan_id: project.plan_id,
+      source: "simulator",
+      message_id: messageId,
+      device_ts: measuredAt,
+      x,
+      y,
+      zone,
+      ts: measuredAt,
+      residual_m: residual,
+      anchors_used: known.length,
+    }));
+    unwrap(await db.from("tags").update({ x, y, battery, last_ts: measuredAt, updated_at: new Date().toISOString() }).eq("tag_id", tagId));
+    const openVisit = unwrap<any>(await db.from("visits").select("visit_key").eq("tag_id", tagId).is("ended_at", null).order("started_at", { ascending: false }).limit(1).maybeSingle());
+    if (!openVisit) {
+      const visitKey = `V-${Math.floor(Date.now() / 1000)}-${tagId}-${crypto.randomUUID().slice(0, 6)}`;
+      unwrap(await db.from("visits").insert({ visit_key: visitKey, tag_id: tagId, employee_id: assignment.employee_id, project_id: projectId, plan_id: project.plan_id, started_at: measuredAt, source: "simulator", deal_status: "" }));
+    }
+    return json(req, { ok: true, tag_id: tagId, project_id: projectId, plan_id: project.plan_id, source: "simulator", message_id: messageId, x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000, zone, residual_m: Math.round(residual * 10000) / 10000, anchors_used: known.length, ts: Date.parse(measuredAt) / 1000 });
   }
 
   return fail(req, 404, `Unknown endpoint: ${method} ${path}`);
@@ -842,6 +1263,9 @@ Deno.serve(async (req: Request) => {
     return await route(req, profile);
   } catch (error) {
     if (error instanceof Response) return fail(req, error.status, error.status === 403 ? "ไม่มีสิทธิ์ดำเนินการ" : error.statusText);
+    if (error instanceof HttpError) return fail(req, error.status, error.message);
+    if ((error as any)?.code === "23505") return fail(req, 409, "A record with the same unique identifier already exists");
+    if ((error as any)?.code === "23503") return fail(req, 409, "A referenced project, employee, or tag does not exist");
     console.error(error);
     return fail(req, 500, error instanceof Error ? error.message : "Internal server error");
   }

@@ -83,13 +83,27 @@ class Simulator:
     def _tick_once(self) -> None:
         self._tick += 1
 
-        tag_rows = db.fetchall("SELECT tag_id, project_id FROM tags WHERE project_id IS NOT NULL")
+        tag_rows = db.fetchall(
+            """
+            SELECT t.tag_id, t.project_id
+            FROM tags AS t
+            JOIN projects AS p ON p.id = t.project_id
+            WHERE t.project_id IS NOT NULL
+              AND t.status = 'active'
+              AND t.tag_type = 'mock'
+              AND p.tracking_mode = 'simulation'
+            """
+        )
+        eligible_tag_ids = {row["tag_id"] for row in tag_rows}
+        for stale_tag_id in set(self._states) - eligible_tag_ids:
+            self._states.pop(stale_tag_id, None)
+
         for row in tag_rows:
             tag_id, project_id = row["tag_id"], row["project_id"]
             zones = q.get_zones(project_id)
 
             state = self._states.get(tag_id)
-            if state is None:
+            if state is None or state.project_id != project_id:
                 start = _pick_target(zones)
                 state = TagState(tag_id=tag_id, project_id=project_id, x=start[0], y=start[1])
                 self._states[tag_id] = state
@@ -107,15 +121,22 @@ class Simulator:
                     and random.random() < 1 / 8):
                 state.target = _pick_target(zones)
 
-            tracking.ingest_fix(tag_id, round(state.x, 3), round(state.y, 3))
+            tracking.ingest_fix(
+                tag_id,
+                round(state.x, 3),
+                round(state.y, 3),
+                project_id=project_id,
+                source="simulator",
+            )
 
             state.present_ticks_left -= 1
             if state.present_ticks_left <= 0:
                 state.present = False
 
-        # Anchor heartbeats — keeps the seeded anchors showing "online" in /api/devices.
+        # Only simulated projects get synthetic anchor heartbeats. Hardware
+        # projects must stay offline until their real gateway reports.
         for p in q.get_projects():
-            if q.get_anchors(p["project_id"]):
+            if p["tracking_mode"] == "simulation" and q.get_anchors(p["project_id"]):
                 q.touch_anchors(p["project_id"])
 
         if self._tick % 5 == 0:

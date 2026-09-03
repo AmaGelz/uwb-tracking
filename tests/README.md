@@ -7,7 +7,11 @@ pytest tests/ -v
 
 These cover the pure-logic modules that don't need a database:
 `positioning.py` (trilateration math), `calculations.py` (anchor
-placement / coverage geometry), and `security.py` (password hashing).
+placement / coverage geometry), `security.py` (password hashing), the
+live-hub fan-out, and `tracking.validate_tracking_policy` — the rule
+that keeps real hardware and simulated demo data from mixing (a gateway
+may only report physical tags in a hardware project, the simulator only
+mock tags in a simulation project).
 
 ## What's *not* covered here
 

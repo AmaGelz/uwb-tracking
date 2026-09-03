@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
+import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from psycopg2.errors import UniqueViolation
+from psycopg2.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 import calculations
@@ -48,6 +51,22 @@ app.add_middleware(
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 
+# Identifiers travel in URLs, gateway configuration files and hardware labels,
+# so they are restricted to characters that survive all three unescaped.
+IdentifierText = Annotated[str, StringConstraints(
+    strip_whitespace=True, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+)]
+HardwareUidText = Annotated[str, StringConstraints(
+    strip_whitespace=True, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+)]
+MessageIdText = Annotated[str, StringConstraints(
+    strip_whitespace=True, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+)]
+
+TagType = Literal["physical", "mock"]
+TagStatus = Literal["active", "disabled"]
+TrackingMode = Literal["hardware", "simulation", "disabled"]
+
 
 class PlanEditorModel(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
@@ -70,6 +89,11 @@ class ProjectCreate(BaseModel):
     plan_name: str = ""
     width_m: float = 20.0
     height_m: float = 20.0
+    tracking_mode: TrackingMode = "simulation"
+
+
+class TrackingModeUpdate(BaseModel):
+    tracking_mode: TrackingMode
 
 
 class AnchorCreate(BaseModel):
@@ -149,6 +173,32 @@ class NoteCreate(BaseModel):
     body: str = Field(min_length=1, max_length=2000)
 
 
+class TagCreate(BaseModel):
+    tag_id: IdentifierText
+    label: str = Field(default="", max_length=200)
+    hardware_uid: HardwareUidText | None = None
+    tag_type: TagType = "physical"
+    status: TagStatus = "active"
+    project_id: IdentifierText | None = None
+    employee_id: IdentifierText | None = None
+
+
+class TagUpdate(BaseModel):
+    label: str | None = Field(default=None, max_length=200)
+    hardware_uid: HardwareUidText | None = None
+    tag_type: TagType | None = None
+    status: TagStatus | None = None
+
+
+class TagAssign(BaseModel):
+    project_id: IdentifierText
+    employee_id: IdentifierText | None = None
+
+
+class GatewayCreate(BaseModel):
+    gateway_id: IdentifierText | None = None
+
+
 class RangeMeasurement(BaseModel):
     anchor_id: str
     distance_m: float
@@ -157,6 +207,28 @@ class RangeMeasurement(BaseModel):
 class PositioningIngest(BaseModel):
     tag_id: str
     ranges: list[RangeMeasurement]
+
+
+class HardwareIngest(BaseModel):
+    """One fix from a real gateway.
+
+    Either ``ranges`` (this API solves the position) or ``x``/``y`` (the
+    gateway solved it on-device) must be present. ``message_id`` makes a
+    retry after a lost response idempotent instead of duplicating the fix.
+    """
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    message_id: MessageIdText
+    tag_id: IdentifierText | None = None
+    hardware_uid: HardwareUidText | None = None
+    project_id: IdentifierText | None = None
+    device_ts: datetime | None = None
+    ranges: list[RangeMeasurement] = Field(default_factory=list, max_length=32)
+    x: float | None = None
+    y: float | None = None
+    residual_m: float | None = Field(default=None, ge=0)
+    anchors_used: int | None = Field(default=None, ge=0)
+    battery: float | None = Field(default=None, ge=0, le=100)
 
 
 # ---------------------------------------------------------------------
@@ -191,6 +263,120 @@ def require_plan(plan_id: str) -> dict[str, Any]:
     if not plan:
         raise HTTPException(status_code=404, detail="ไม่พบแปลน")
     return plan
+
+
+def require_project(project_id: str) -> dict[str, Any]:
+    project = q.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
+    return project
+
+
+# ---------------------------------------------------------------------
+# Tag registry helpers
+# ---------------------------------------------------------------------
+
+def require_tag(tag_id: str) -> dict[str, Any]:
+    tag = q.get_tag(tag_id)
+    if not tag:
+        raise HTTPException(status_code=404, detail="ไม่พบแท็ก")
+    return tag
+
+
+def require_assignable_project(project_id: str, tag_type: str) -> dict[str, Any]:
+    """Check a project can hold a tag of this type before assigning it.
+
+    A physical tag switches its project to hardware mode (the data layer does
+    that in the same statement as the assignment), so only the reverse pairing
+    is rejected: a mock tag would have the simulator moving it inside a project
+    whose real hardware is reporting the same floor.
+    """
+    project = require_project(project_id)
+    mode = project["tracking_mode"]
+    if mode == "disabled":
+        raise HTTPException(status_code=409, detail="โครงการนี้ปิดการติดตามอยู่")
+    if tag_type == "mock" and mode == "hardware":
+        raise HTTPException(status_code=409, detail="แท็กจำลองใช้กับโครงการโหมดใช้งานจริงไม่ได้")
+    return project
+
+
+def require_employee(employee_id: str | None) -> None:
+    if employee_id and not q.get_user_by_employee_id(employee_id):
+        raise HTTPException(status_code=404, detail="ไม่พบพนักงานรหัสนี้")
+
+
+def _hash_gateway_key(gateway_key: str) -> str:
+    return hashlib.sha256(gateway_key.encode("utf-8")).hexdigest()
+
+
+# A fix from the future means a broken clock; a very old one is a replay or a
+# queue that has been offline for hours. Neither describes a live position.
+MAX_CLOCK_SKEW = timedelta(minutes=5)
+MAX_MESSAGE_AGE = timedelta(minutes=15)
+
+
+def hardware_device_ts(device_ts: datetime | None) -> datetime:
+    if device_ts is None:
+        return utc_now()
+    if device_ts.tzinfo is None:
+        device_ts = device_ts.replace(tzinfo=timezone.utc)
+    skew = device_ts - utc_now()
+    if skew > MAX_CLOCK_SKEW:
+        raise HTTPException(status_code=422, detail="device_ts อยู่ในอนาคต")
+    if -skew > MAX_MESSAGE_AGE:
+        raise HTTPException(status_code=422, detail="device_ts เก่าเกินกว่าจะรับเป็นตำแหน่งปัจจุบัน")
+    return device_ts
+
+
+def project_anchor_positions(project: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    """Anchors of the project's active plan, or every anchor it has.
+
+    Anchors were project-scoped before the plan editor existed, so a survey
+    that has not been migrated to a plan still resolves positions.
+    """
+    plan_id = project.get("plan_id") or ""
+    anchors = q.get_plan_anchors(plan_id) if plan_id else []
+    if not anchors:
+        anchors = project.get("anchors") or q.get_anchors(project["project_id"])
+    return {anchor["anchor_id"]: (anchor["x"], anchor["y"]) for anchor in anchors}
+
+
+def solve_ranges(
+    project: dict[str, Any], ranges: list[RangeMeasurement],
+) -> tuple[positioning.Fix, list[str]]:
+    """Multilaterate one report, ignoring anchors this project does not know."""
+    anchor_by_id = project_anchor_positions(project)
+    used: list[str] = []
+    known: list[tuple[tuple[float, float], float]] = []
+    for measurement in ranges:
+        anchor_id = measurement.anchor_id.strip()
+        if anchor_id in used or anchor_id not in anchor_by_id:
+            continue
+        if not math.isfinite(measurement.distance_m) or measurement.distance_m <= 0:
+            continue
+        used.append(anchor_id)
+        known.append((anchor_by_id[anchor_id], measurement.distance_m))
+
+    if len(known) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ต้องมีระยะจาก anchor ที่รู้จักในโครงการนี้อย่างน้อย 3 จุด (ใช้ได้ {len(known)})",
+        )
+    fix = positioning.trilaterate([position for position, _d in known], [d for _p, d in known])
+    if fix is None:
+        raise HTTPException(status_code=422, detail="คำนวณตำแหน่งไม่สำเร็จ (ระยะที่ได้อาจไม่สอดคล้องกัน)")
+    return fix, used
+
+
+def tracking_error_status(error: tracking.TrackingPolicyError) -> int:
+    """Map an ingest policy rejection onto the HTTP status it deserves."""
+    if isinstance(error, tracking.UnknownTagError):
+        return 404
+    if isinstance(error, (tracking.TagSourceMismatchError, tracking.InactiveTagError)):
+        return 403
+    if isinstance(error, (tracking.TagProjectMismatchError, tracking.ProjectModeMismatchError)):
+        return 409
+    return 422
 
 
 def normalise_zone(payload: PlanZoneCreate) -> dict[str, Any]:
@@ -421,15 +607,113 @@ def overview(
 
 
 @app.get("/api/devices")
-def devices(x_session: str | None = Header(default=None)):
+def devices(x_session: str | None = Header(default=None), project_id: str | None = None):
     require_user(x_session)
-    return {"ok": True, "anchors": q.get_anchors(), "tags": q.get_tags()}
+    return {
+        "ok": True,
+        "anchors": q.get_anchors(project_id),
+        "tags": q.get_tags(project_id),
+    }
 
 
 @app.get("/api/live")
-def live(x_session: str | None = Header(default=None), since: float = 0, rows: int = 400):
+def live(
+    x_session: str | None = Header(default=None),
+    since: float = 0,
+    rows: int = 400,
+    project_id: str | None = None,
+):
     require_user(x_session)
-    return q.get_live_tags(rows=rows, since=since)
+    return q.get_live_tags(rows=rows, since=since, project_id=project_id)
+
+
+# ---------------------------------------------------------------------
+# Tag registry — physical hardware vs. simulated demo tags
+# ---------------------------------------------------------------------
+
+@app.get("/api/tags")
+def tags_list(x_session: str | None = Header(default=None), project_id: str | None = None):
+    require_user(x_session)
+    return {"ok": True, "tags": q.get_tags(project_id)}
+
+
+@app.post("/api/tags", status_code=201)
+def tag_create(payload: TagCreate, x_session: str | None = Header(default=None)):
+    """Register a tag and, when a project is named, assign it there at once."""
+    user = require_role(x_session, {"admin"})
+    if q.get_tag(payload.tag_id):
+        raise HTTPException(status_code=409, detail="Tag ID นี้มีอยู่แล้ว")
+
+    require_employee(payload.employee_id)
+    if payload.project_id:
+        require_assignable_project(payload.project_id, payload.tag_type)
+
+    data = payload.model_dump()
+    data["label"] = payload.label.strip() or payload.tag_id
+    try:
+        tag = q.create_tag(data, assigned_by=user["id"])
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Tag ID หรือ Hardware UID ซ้ำกับแท็กอื่น") from exc
+    except ForeignKeyViolation as exc:
+        raise HTTPException(status_code=409, detail="โครงการหรือพนักงานที่อ้างถึงไม่มีอยู่") from exc
+    if not tag:
+        raise HTTPException(status_code=409, detail="ลงทะเบียนแท็กไม่สำเร็จ")
+    return {"ok": True, "tag": tag}
+
+
+@app.get("/api/tags/{tag_id}")
+def tag_detail(tag_id: str, x_session: str | None = Header(default=None)):
+    require_user(x_session)
+    return {"ok": True, "tag": require_tag(tag_id)}
+
+
+@app.patch("/api/tags/{tag_id}")
+def tag_update(tag_id: str, payload: TagUpdate, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    existing = require_tag(tag_id)
+
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="ไม่มีข้อมูลสำหรับแก้ไขแท็ก")
+    if "label" in data:
+        data["label"] = (data["label"] or "").strip() or tag_id
+    if data.get("tag_type") and existing["project_id"]:
+        require_assignable_project(existing["project_id"], data["tag_type"])
+
+    try:
+        tag = q.update_tag(tag_id, data)
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Hardware UID ซ้ำกับแท็กอื่น") from exc
+    return {"ok": True, "tag": tag}
+
+
+@app.post("/api/tags/{tag_id}/assign")
+def tag_assign(tag_id: str, payload: TagAssign, x_session: str | None = Header(default=None)):
+    """Move a tag to another project or hand it to another employee.
+
+    The previous assignment is ended rather than overwritten, and any visit
+    still open on the old project is closed, so history stays attributed to
+    where it was actually recorded.
+    """
+    user = require_role(x_session, {"admin"})
+    existing = require_tag(tag_id)
+    require_assignable_project(payload.project_id, existing["tag_type"])
+    require_employee(payload.employee_id)
+
+    try:
+        tag = q.assign_tag(tag_id, payload.project_id, payload.employee_id, assigned_by=user["id"])
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="แท็กนี้มีการมอบหมายที่ยังใช้งานอยู่") from exc
+    if not tag:
+        raise HTTPException(status_code=409, detail="ย้ายโครงการไม่สำเร็จ")
+    return {"ok": True, "tag": tag}
+
+
+@app.post("/api/tags/{tag_id}/deactivate")
+def tag_deactivate(tag_id: str, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    require_tag(tag_id)
+    return {"ok": True, "tag": q.deactivate_tag(tag_id)}
 
 
 def websocket_session_token(websocket: WebSocket) -> str | None:
@@ -572,10 +856,87 @@ def plan_create(project_id: str, payload: PlanCreate, x_session: str | None = He
 @app.get("/api/projects/{project_id}")
 def project_detail(project_id: str, x_session: str | None = Header(default=None)):
     require_user(x_session)
-    project = q.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
-    return project
+    return require_project(project_id)
+
+
+@app.post("/api/projects/{project_id}/tracking-mode")
+def project_tracking_mode(
+    project_id: str, payload: TrackingModeUpdate, x_session: str | None = Header(default=None),
+):
+    """Switch a project between real hardware, the simulator, and off.
+
+    Leaving hardware mode while physical tags are still assigned would hand
+    those tags to the simulator, so the tags have to be moved or disabled
+    first.
+    """
+    require_role(x_session, {"admin"})
+    require_project(project_id)
+
+    if payload.tracking_mode != "hardware":
+        physical = [
+            tag for tag in q.get_tags(project_id)
+            if tag["tag_type"] == "physical" and tag["status"] == "active"
+        ]
+        if physical:
+            raise HTTPException(
+                status_code=409,
+                detail="ยังมีแท็กอุปกรณ์จริงในโครงการนี้ กรุณาย้ายหรือปิดใช้งานก่อน "
+                       f"({', '.join(tag['tag_id'] for tag in physical)})",
+            )
+
+    project = q.set_project_tracking_mode(project_id, payload.tracking_mode)
+    return {"ok": True, "project": project}
+
+
+# ---------------------------------------------------------------------
+# Gateway credentials
+# ---------------------------------------------------------------------
+
+@app.get("/api/projects/{project_id}/gateways")
+def project_gateways(project_id: str, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    require_project(project_id)
+    return {"ok": True, "gateways": q.get_project_gateways(project_id)}
+
+
+@app.post("/api/projects/{project_id}/gateways", status_code=201)
+def gateway_create(
+    project_id: str, payload: GatewayCreate, x_session: str | None = Header(default=None),
+):
+    """Issue one gateway key for a project.
+
+    The key is returned exactly once and only its SHA-256 digest is stored, so
+    a leaked database dump cannot be replayed against the ingest endpoint. A
+    lost key is replaced by revoking the gateway and creating a new one.
+    """
+    require_role(x_session, {"admin"})
+    require_project(project_id)
+
+    gateway_id = payload.gateway_id or f"GW-{secrets.token_hex(4).upper()}"
+    gateway_key = secrets.token_urlsafe(32)
+    try:
+        gateway = q.create_gateway_credential(project_id, gateway_id, _hash_gateway_key(gateway_key))
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Gateway ID นี้มีอยู่แล้ว") from exc
+    if not gateway:
+        raise HTTPException(status_code=409, detail="สร้าง Gateway ไม่สำเร็จ")
+    return {
+        "ok": True,
+        "gateway": gateway,
+        "gateway_key": gateway_key,
+        "warning": "คัดลอก Key นี้ทันที ระบบจะไม่แสดงอีก",
+    }
+
+
+@app.post("/api/projects/{project_id}/gateways/{gateway_id}/revoke")
+def gateway_revoke(
+    project_id: str, gateway_id: str, x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    gateway = q.revoke_gateway(project_id, gateway_id)
+    if not gateway:
+        raise HTTPException(status_code=404, detail="ไม่พบ Gateway นี้ในโครงการ")
+    return {"ok": True, "gateway": gateway}
 
 
 @app.get("/api/plans/{plan_id}")
@@ -790,50 +1151,151 @@ def calculate_coverage(payload: dict[str, Any], x_session: str | None = Header(d
 @app.get("/api/positioning/{project_id}")
 def positioning_snapshot(project_id: str, x_session: str | None = Header(default=None)):
     require_user(x_session)
-    if not q.get_project(project_id):
-        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
-    live = q.get_live_tags(rows=0)
+    require_project(project_id)
+    live = q.get_live_tags(rows=0, project_id=project_id)
     return {"ok": True, "project_id": project_id, "tags": live.get("tags", {})}
 
 
 @app.post("/api/positioning/{project_id}/ingest")
 def positioning_ingest(project_id: str, payload: PositioningIngest, x_session: str | None = Header(default=None)):
-    """Real UWB positioning entry point: turn raw anchor-to-tag ranges into
-    an (x, y) fix via least-squares multilateration (see positioning.py),
-    persist it, and keep the visit lifecycle in sync — exactly like the
-    demo simulator does, so real hardware can replace the simulator with
-    no other backend changes. Point your anchor gateway / tag firmware
-    here once it's reporting real two-way-ranging distances."""
-    require_user(x_session)
+    """Turn raw anchor-to-tag ranges into a fix for a *simulated* project.
 
-    project = q.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
-
-    anchor_by_id = {a["anchor_id"]: (a["x"], a["y"]) for a in project["anchors"]}
-    known = [(anchor_by_id[r.anchor_id], r.distance_m) for r in payload.ranges if r.anchor_id in anchor_by_id]
-
-    if len(known) < 3:
+    This path is authenticated as a dashboard admin, so it is the one to use
+    for bench tests and demos: it accepts mock tags in a project whose
+    tracking_mode is `simulation`. Real gateways have no session to sign in
+    with and post to `/api/uwb/ingest` instead, where the project-scoped
+    gateway key is the credential.
+    """
+    require_role(x_session, {"admin"})
+    project = require_project(project_id)
+    if project["tracking_mode"] != "simulation":
         raise HTTPException(
-            status_code=400,
-            detail=f"ต้องมีระยะจาก anchor ที่รู้จักในโครงการนี้อย่างน้อย 3 จุด (ได้รับ {len(known)})",
+            status_code=403,
+            detail="ปลายทางนี้รับเฉพาะโครงการโหมดจำลอง อุปกรณ์จริงต้องส่งผ่าน /api/uwb/ingest",
         )
 
-    anchor_positions = [k[0] for k in known]
-    distances = [k[1] for k in known]
-    fix = positioning.trilaterate(anchor_positions, distances)
-    if fix is None:
-        raise HTTPException(status_code=422, detail="คำนวณตำแหน่งไม่สำเร็จ (ระยะที่ได้อาจไม่สอดคล้องกัน)")
+    fix, _used = solve_ranges(project, payload.ranges)
+    try:
+        result = tracking.ingest_fix(
+            payload.tag_id,
+            fix.x,
+            fix.y,
+            project_id=project_id,
+            source="simulator",
+            residual_m=fix.residual_m,
+            anchors_used=fix.anchors_used,
+        )
+    except tracking.TrackingPolicyError as exc:
+        raise HTTPException(status_code=tracking_error_status(exc), detail=str(exc)) from exc
 
-    result = tracking.ingest_fix(payload.tag_id, fix.x, fix.y)
     return {
         "ok": True,
         "tag_id": payload.tag_id,
+        "project_id": result["project_id"],
+        "plan_id": result["plan_id"],
+        "source": result["source"],
         "x": round(fix.x, 3),
         "y": round(fix.y, 3),
         "zone": result["zone"],
         "residual_m": fix.residual_m,
         "anchors_used": fix.anchors_used,
+        "ts": result["ts"],
+    }
+
+
+@app.post("/api/uwb/ingest")
+def uwb_ingest(
+    payload: HardwareIngest,
+    x_gateway_id: str | None = Header(default=None),
+    x_gateway_key: str | None = Header(default=None),
+):
+    """Hardware ingest for real UWB gateways.
+
+    A gateway is an unattended device, so it authenticates with the
+    project-scoped key issued by `POST /api/projects/{id}/gateways` rather
+    than a dashboard session. Only the key's SHA-256 digest is stored. The
+    project comes from the credential, never from the request body, and
+    `tracking.ingest_fix` enforces the physical-tag / hardware-project
+    boundary before anything is written.
+    """
+    if not x_gateway_id or not x_gateway_key:
+        raise HTTPException(status_code=401, detail="ต้องมี X-Gateway-Id และ X-Gateway-Key")
+
+    credential = q.get_gateway_credential(x_gateway_id.strip())
+    # An unknown gateway, a revoked one, and a wrong key all answer alike.
+    if not credential or credential["status"] != "active":
+        raise HTTPException(status_code=401, detail="Gateway ไม่ได้รับอนุญาต")
+    project_id = credential["project_id"]
+    if not q.gateway_key_is_valid(project_id, credential["gateway_id"], _hash_gateway_key(x_gateway_key)):
+        raise HTTPException(status_code=401, detail="Gateway ไม่ได้รับอนุญาต")
+    if payload.project_id and payload.project_id != project_id:
+        raise HTTPException(status_code=403, detail="Gateway นี้ไม่ได้ผูกกับโครงการที่ระบุ")
+
+    project = require_project(project_id)
+    if project["tracking_mode"] != "hardware":
+        raise HTTPException(status_code=409, detail=f"โครงการ {project_id} ไม่ได้อยู่ในโหมดใช้งานจริง")
+
+    tag_id = payload.tag_id
+    if not tag_id:
+        if not payload.hardware_uid:
+            raise HTTPException(status_code=422, detail="ต้องระบุ tag_id หรือ hardware_uid")
+        tag = q.get_tag_by_hardware_uid(payload.hardware_uid)
+        if not tag:
+            raise HTTPException(status_code=404, detail="Hardware UID นี้ยังไม่ได้ลงทะเบียน")
+        tag_id = tag["tag_id"]
+
+    device_ts = hardware_device_ts(payload.device_ts)
+    used: list[str] = []
+    if payload.ranges:
+        fix, used = solve_ranges(project, payload.ranges)
+        x, y = fix.x, fix.y
+        residual_m: float | None = fix.residual_m
+        anchors_used: int | None = fix.anchors_used
+    elif payload.x is None or payload.y is None:
+        # A gateway that solves positions on-device may post the fix directly.
+        raise HTTPException(status_code=422, detail="ต้องส่ง ranges หรือพิกัด x/y ที่คำนวณแล้ว")
+    else:
+        x, y = payload.x, payload.y
+        residual_m, anchors_used = payload.residual_m, payload.anchors_used
+
+    try:
+        result = tracking.ingest_fix(
+            tag_id,
+            x,
+            y,
+            ts=device_ts,
+            project_id=project_id,
+            source="hardware",
+            gateway_id=credential["gateway_id"],
+            message_id=payload.message_id,
+            device_ts=device_ts,
+            residual_m=residual_m,
+            anchors_used=anchors_used,
+            battery=payload.battery,
+        )
+    except tracking.TrackingPolicyError as exc:
+        raise HTTPException(status_code=tracking_error_status(exc), detail=str(exc)) from exc
+
+    q.touch_gateway(credential["gateway_id"])
+    # The anchors that produced this fix are demonstrably alive, so anchor
+    # status follows the gateway instead of the simulator's heartbeat.
+    if used and not result["duplicate"]:
+        q.touch_anchor_ids(project_id, used)
+
+    return {
+        "ok": True,
+        "duplicate": result["duplicate"],
+        "tag_id": tag_id,
+        "project_id": result["project_id"],
+        "plan_id": result["plan_id"],
+        "gateway_id": result["gateway_id"],
+        "message_id": result["message_id"],
+        "source": result["source"],
+        "x": round(result["x"], 3),
+        "y": round(result["y"], 3),
+        "zone": result["zone"],
+        "residual_m": residual_m,
+        "anchors_used": anchors_used,
         "ts": result["ts"],
     }
 

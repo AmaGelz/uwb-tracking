@@ -16,8 +16,11 @@ INSERT INTO users (id, employee_id, email, password_hash, role, position, first_
 INSERT INTO users (id, employee_id, email, password_hash, role, position, first_th, last_th, first_en, last_en, phone, tag_id) VALUES ('u-sale2', 'SALE002', 'somchai.d@supalai.com', 'pbkdf2_sha256$120000$d2b6b6f2c1e94a2c9b6e4f7a10b2c344$f0c24f4ada126701585ba7ce471d5f454778aaf345e1f6c10922bc34b31fb958', 'sale', 'Sales Representative', 'สมชาย', 'ดีเลิศ', 'Somchai', 'Deelert', '0812345002', 'TAG02') ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------- projects
-INSERT INTO projects (id, name, province, plan_id, plan_name, width_m, height_m) VALUES ('P001', 'SUPALAI Demo Project', 'กรุงเทพมหานคร', 'PLAN01', 'Main Floor', 20, 15) ON CONFLICT (id) DO NOTHING;
-INSERT INTO projects (id, name, province, plan_id, plan_name, width_m, height_m) VALUES ('P002', 'ศุภาลัย วิลล์ ราชพฤกษ์', 'นนทบุรี', 'PLAN-B', 'แบบบ้าน B - 2 ชั้น', 6.5, 6.5) ON CONFLICT (id) DO NOTHING;
+-- Both seeded projects intentionally keep the schema default
+-- tracking_mode='simulation'. Registering a physical tag through the admin API
+-- switches only the selected project to hardware mode.
+INSERT INTO projects (id, name, province, plan_id, plan_name, width_m, height_m, tracking_mode) VALUES ('P001', 'SUPALAI Demo Project', 'กรุงเทพมหานคร', 'PLAN01', 'Main Floor', 20, 15, 'simulation') ON CONFLICT (id) DO NOTHING;
+INSERT INTO projects (id, name, province, plan_id, plan_name, width_m, height_m, tracking_mode) VALUES ('P002', 'ศุภาลัย วิลล์ ราชพฤกษ์', 'นนทบุรี', 'PLAN-B', 'แบบบ้าน B - 2 ชั้น', 6.5, 6.5, 'simulation') ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------- zones
 INSERT INTO zones (project_id, name, x_min, x_max, y_min, y_max) VALUES ('P001', 'Entrance', 0.0, 4.0, 0.0, 15.0) ON CONFLICT (project_id, name) DO NOTHING;
@@ -35,10 +38,30 @@ INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P00
 INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P001', 'A02', 19.0, 1.0, 91, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
 INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P001', 'A03', 1.0, 14.0, 88, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
 INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P001', 'A04', 19.0, 14.0, 93, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
+INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P002', 'A01', 0.5, 0.5, 96, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
+INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P002', 'A02', 6.0, 0.5, 94, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
+INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P002', 'A03', 0.5, 6.0, 92, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
+INSERT INTO anchors (project_id, anchor_id, x, y, battery, last_ts) VALUES ('P002', 'A04', 6.0, 6.0, 90, now()) ON CONFLICT (project_id, anchor_id) DO NOTHING;
 
 -- ---------------------------------------------------- tags
-INSERT INTO tags (tag_id, employee_id, project_id, x, y, battery, last_ts) VALUES ('TAG01', 'SALE001', 'P001', 8.2, 6.4, 82, now()) ON CONFLICT (tag_id) DO NOTHING;
-INSERT INTO tags (tag_id, employee_id, project_id, x, y, battery, last_ts) VALUES ('TAG02', 'SALE002', 'P001', 14.5, 10.2, 77, now()) ON CONFLICT (tag_id) DO NOTHING;
+-- All shipped demo tags are explicitly mock. A real hardware identifier must
+-- be registered through the admin workflow rather than being seeded.
+INSERT INTO tags (tag_id, label, tag_type, status, employee_id, project_id, x, y, battery, last_ts) VALUES ('TAG01', 'Demo tag 01', 'mock', 'active', 'SALE001', 'P001', 8.2, 6.4, 82, now()) ON CONFLICT (tag_id) DO NOTHING;
+INSERT INTO tags (tag_id, label, tag_type, status, employee_id, project_id, x, y, battery, last_ts) VALUES ('TAG02', 'Demo tag 02', 'mock', 'active', 'SALE002', 'P001', 14.5, 10.2, 77, now()) ON CONFLICT (tag_id) DO NOTHING;
+INSERT INTO tags (tag_id, label, tag_type, status, employee_id, project_id, x, y, battery, last_ts) VALUES ('MOCK-P002-01', 'P002 demo tag', 'mock', 'active', NULL, 'P002', 3.0, 3.0, 85, now()) ON CONFLICT (tag_id) DO NOTHING;
+
+-- Initialize assignment history without reactivating a tag that an admin has
+-- already moved or deactivated. The legacy project_id/employee_id columns are
+-- retained as the current snapshot for backwards-compatible clients.
+INSERT INTO tag_assignments (tag_id, project_id, employee_id)
+SELECT tag.tag_id, tag.project_id, tag.employee_id
+FROM tags tag
+WHERE tag.tag_id IN ('TAG01', 'TAG02', 'MOCK-P002-01')
+  AND tag.project_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM tag_assignments assignment
+      WHERE assignment.tag_id = tag.tag_id
+  );
 
 -- ---------------------------------------------------- customers
 INSERT INTO customers (id, name) VALUES ('C001', 'Demo Customer') ON CONFLICT (id) DO NOTHING;
@@ -87,6 +110,12 @@ INSERT INTO visits (visit_key, tag_id, employee_id, project_id, plan_id, custome
 INSERT INTO visits (visit_key, tag_id, employee_id, project_id, plan_id, customer_id, started_at, ended_at, duration_sec, zone, deal_status) VALUES ('V-DEMO-0032', 'TAG01', 'SALE001', 'P001', 'PLAN01', 'C008', '2026-08-15T15:56:04+00:00', '2026-08-15T16:15:44+00:00', 1180, 'Kitchen', '') ON CONFLICT (visit_key) DO NOTHING;
 INSERT INTO visits (visit_key, tag_id, employee_id, project_id, plan_id, customer_id, started_at, ended_at, duration_sec, zone, deal_status) VALUES ('V-DEMO-0033', 'TAG01', 'SALE001', 'P001', 'PLAN01', 'C002', '2026-08-16T14:59:42+00:00', '2026-08-16T15:09:46+00:00', 604, 'Living Room', '') ON CONFLICT (visit_key) DO NOTHING;
 INSERT INTO visits (visit_key, tag_id, employee_id, project_id, plan_id, customer_id, started_at, ended_at, duration_sec, zone, deal_status) VALUES ('V-DEMO-0034', 'TAG02', 'SALE002', 'P001', 'PLAN01', 'C005', '2026-08-16T14:38:13+00:00', '2026-08-16T15:30:12+00:00', 3119, 'Kitchen', '') ON CONFLICT (visit_key) DO NOTHING;
+
+-- Keep analytics able to exclude deterministic demo history from physical
+-- hardware records even when this seed is applied to an existing database.
+UPDATE visits
+SET source = 'simulator'
+WHERE visit_key LIKE 'V-DEMO-%';
 
 -- ---------------------------------------------------- notes
 INSERT INTO notes (visit_key, user_id, body, created_at, seed_key) VALUES ('V-DEMO-0016', 'u-sale', 'ขอเอกสารสินเชื่อไปศึกษาเพิ่มเติม', now(), 'SEED-NOTE-0001') ON CONFLICT (seed_key) DO NOTHING;

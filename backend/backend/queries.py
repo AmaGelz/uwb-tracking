@@ -29,6 +29,10 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
     return db.fetchone("SELECT * FROM users WHERE id = %s", (user_id,))
 
 
+def get_user_by_employee_id(employee_id: str) -> dict[str, Any] | None:
+    return db.fetchone("SELECT * FROM users WHERE employee_id = %s", (employee_id,))
+
+
 def all_users() -> list[dict[str, Any]]:
     return db.fetchall(
         """
@@ -64,7 +68,8 @@ def get_session_user(token: str) -> str | None:
 def get_projects() -> list[dict[str, Any]]:
     projects = db.fetchall(
         """
-        SELECT id AS project_id, name, province, plan_id, plan_name, width_m, height_m
+        SELECT id AS project_id, name, province, plan_id, plan_name,
+               width_m, height_m, tracking_mode
         FROM projects
         ORDER BY name
         """
@@ -90,6 +95,11 @@ def get_project(project_id: str) -> dict[str, Any] | None:
             row["zones"] = get_zones(project_id)
             return row
     return None
+
+
+def get_project_tracking_mode(project_id: str) -> str | None:
+    row = db.fetchone("SELECT tracking_mode FROM projects WHERE id = %s", (project_id,))
+    return row["tracking_mode"] if row else None
 
 
 # ---------------------------------------------------------------------
@@ -118,6 +128,20 @@ def get_plan(plan_id: str) -> dict[str, Any] | None:
         WHERE id = %s
         """,
         (plan_id,),
+    )
+
+
+def get_active_plan(project_id: str) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        SELECT id AS plan_id, project_id, name, width_m, height_m,
+               is_active, version, created_at, updated_at
+        FROM plans
+        WHERE project_id = %s
+        ORDER BY is_active DESC, updated_at DESC, id
+        LIMIT 1
+        """,
+        (project_id,),
     )
 
 
@@ -455,15 +479,44 @@ def touch_anchors(project_id: str) -> None:
     db.execute("UPDATE anchors SET last_ts = %s WHERE project_id = %s", (utc_now(), project_id))
 
 
+def touch_anchor_ids(project_id: str, anchor_ids: list[str]) -> None:
+    if not anchor_ids:
+        return
+    db.execute(
+        "UPDATE anchors SET last_ts = %s WHERE project_id = %s AND anchor_id = ANY(%s)",
+        (utc_now(), project_id, anchor_ids),
+    )
+
+
 def get_tags(project_id: str | None = None) -> list[dict[str, Any]]:
-    where = "WHERE t.project_id = %s" if project_id else ""
+    """Return registered tags, optionally scoped to one project.
+
+    ``tags.project_id`` and ``tags.employee_id`` remain populated for the
+    original dashboard contract.  New code also records every assignment in
+    ``tag_assignments``; the active assignment wins when one exists.
+    """
+    where = "WHERE COALESCE(assignment.project_id, t.project_id) = %s" if project_id else ""
     params = (project_id,) if project_id else ()
     rows = db.fetchall(
         f"""
-        SELECT t.tag_id, t.project_id, t.x, t.y, t.battery, t.last_ts,
+        SELECT t.tag_id,
+               COALESCE(assignment.project_id, t.project_id) AS project_id,
+               COALESCE(assignment.employee_id, t.employee_id) AS employee_id,
+               assignment.id AS assignment_id,
+               assignment.assigned_at,
+               t.hardware_uid, t.label, t.tag_type, t.status,
+               t.x, t.y, t.battery, t.last_ts, t.created_at, t.updated_at,
                u.first_en || ' ' || u.last_en AS sale_name
         FROM tags t
-        LEFT JOIN users u ON u.employee_id = t.employee_id
+        LEFT JOIN LATERAL (
+            SELECT a.id, a.project_id, a.employee_id, a.assigned_at
+            FROM tag_assignments a
+            WHERE a.tag_id = t.tag_id AND a.ended_at IS NULL
+            ORDER BY a.assigned_at DESC, a.id DESC
+            LIMIT 1
+        ) AS assignment ON true
+        LEFT JOIN users u
+          ON u.employee_id = COALESCE(assignment.employee_id, t.employee_id)
         {where}
         ORDER BY t.tag_id
         """,
@@ -471,13 +524,303 @@ def get_tags(project_id: str | None = None) -> list[dict[str, Any]]:
     )
     now = utc_now()
     for t in rows:
-        t["on"] = bool(t["last_ts"] and (now - t["last_ts"]).total_seconds() <= TAG_ONLINE_SEC)
+        t["on"] = bool(
+            t["status"] == "active"
+            and t["last_ts"]
+            and (now - t["last_ts"]).total_seconds() <= TAG_ONLINE_SEC
+        )
         t["last_ts"] = to_epoch(t["last_ts"])
+        t["assigned_at"] = to_epoch(t["assigned_at"])
+        t["created_at"] = to_epoch(t["created_at"])
+        t["updated_at"] = to_epoch(t["updated_at"])
     return rows
 
 
-def get_live_tags(rows: int = 400, since: float = 0) -> dict[str, Any]:
-    tags = get_tags()
+def get_tag(tag_id: str) -> dict[str, Any] | None:
+    return next((tag for tag in get_tags() if tag["tag_id"] == tag_id), None)
+
+
+def get_tag_by_hardware_uid(hardware_uid: str) -> dict[str, Any] | None:
+    """Map a device serial number to its registered tag.
+
+    Firmware that only knows its own UID can report that instead of the
+    logical tag_id; the ingest policy checks still run against the tag.
+    """
+    return db.fetchone(
+        "SELECT tag_id, tag_type, status, project_id FROM tags WHERE hardware_uid = %s",
+        (hardware_uid,),
+    )
+
+
+def get_tracking_tag(tag_id: str) -> dict[str, Any] | None:
+    """Small, timestamp-preserving tag record used by ingest policy checks."""
+    return db.fetchone(
+        """
+        SELECT tag_id, employee_id, project_id, hardware_uid, label,
+               tag_type, status, battery, last_ts
+        FROM tags
+        WHERE tag_id = %s
+        """,
+        (tag_id,),
+    )
+
+
+def create_tag(data: dict[str, Any], assigned_by: str | None = None) -> dict[str, Any] | None:
+    """Register a tag and optionally create its first active assignment.
+
+    The CTE keeps the registry row, assignment history, legacy user/tag
+    mirrors, and automatic hardware-project switch in one transaction.
+    """
+    row = db.fetchone(
+        """
+        WITH inserted_tag AS (
+            INSERT INTO tags (
+                tag_id, hardware_uid, label, tag_type, status,
+                employee_id, project_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        ), assignment AS (
+            INSERT INTO tag_assignments (
+                tag_id, project_id, employee_id, assigned_by, assigned_at
+            )
+            SELECT tag_id, project_id, employee_id, %s, now()
+            FROM inserted_tag
+            WHERE project_id IS NOT NULL
+            RETURNING tag_id
+        ), linked_user AS (
+            UPDATE users AS u
+            SET tag_id = inserted_tag.tag_id
+            FROM inserted_tag
+            WHERE inserted_tag.employee_id IS NOT NULL
+              AND u.employee_id = inserted_tag.employee_id
+            RETURNING u.id
+        ), hardware_project AS (
+            UPDATE projects AS p
+            SET tracking_mode = 'hardware', updated_at = now()
+            FROM inserted_tag
+            WHERE inserted_tag.tag_type = 'physical'
+              AND p.id = inserted_tag.project_id
+            RETURNING p.id
+        )
+        SELECT tag_id FROM inserted_tag
+        """,
+        (
+            data["tag_id"], data.get("hardware_uid"), data.get("label"),
+            data.get("tag_type", "physical"), data.get("status", "active"),
+            data.get("employee_id"), data.get("project_id"), assigned_by,
+        ),
+    )
+    return get_tag(row["tag_id"]) if row else None
+
+
+def update_tag(tag_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"hardware_uid", "label", "tag_type", "status"}
+    changes = [(key, value) for key, value in data.items() if key in allowed]
+    if not changes:
+        return get_tag(tag_id)
+
+    assignments = [f"{key} = %s" for key, _value in changes]
+    params: list[Any] = [value for _key, value in changes]
+    params.append(tag_id)
+    row = db.fetchone(
+        f"""
+        WITH updated_tag AS (
+            UPDATE tags
+            SET {', '.join(assignments)}, updated_at = now()
+            WHERE tag_id = %s
+            RETURNING *
+        ), hardware_project AS (
+            UPDATE projects AS p
+            SET tracking_mode = 'hardware', updated_at = now()
+            FROM updated_tag AS t
+            WHERE t.tag_type = 'physical' AND p.id = t.project_id
+            RETURNING p.id
+        ), closed_visits AS (
+            UPDATE visits AS v
+            SET ended_at = now(),
+                duration_sec = GREATEST(0, EXTRACT(EPOCH FROM (now() - v.started_at))::integer)
+            FROM updated_tag AS t
+            WHERE t.status = 'disabled'
+              AND v.tag_id = t.tag_id
+              AND v.ended_at IS NULL
+            RETURNING v.id
+        )
+        SELECT tag_id FROM updated_tag
+        """,
+        tuple(params),
+    )
+    return get_tag(row["tag_id"]) if row else None
+
+
+def assign_tag(
+    tag_id: str,
+    project_id: str,
+    employee_id: str | None,
+    assigned_by: str | None = None,
+) -> dict[str, Any] | None:
+    """Replace a tag's active assignment while retaining its history."""
+    row = db.fetchone(
+        """
+        WITH candidate AS (
+            SELECT t.tag_id, t.tag_type
+            FROM tags AS t
+            JOIN projects AS p ON p.id = %s
+            WHERE t.tag_id = %s
+        ), ended_assignment AS (
+            UPDATE tag_assignments AS a
+            SET ended_at = now()
+            WHERE a.tag_id = %s AND a.ended_at IS NULL
+              AND EXISTS (SELECT 1 FROM candidate)
+            RETURNING a.id
+        ), inserted_assignment AS (
+            INSERT INTO tag_assignments (
+                tag_id, project_id, employee_id, assigned_by, assigned_at
+            )
+            SELECT c.tag_id, %s, %s, %s, now()
+            FROM candidate AS c
+            CROSS JOIN (SELECT count(*) FROM ended_assignment) AS dependency
+            RETURNING tag_id
+        ), updated_tag AS (
+            UPDATE tags AS t
+            SET project_id = %s,
+                employee_id = %s,
+                x = NULL,
+                y = NULL,
+                last_ts = NULL,
+                updated_at = now()
+            FROM inserted_assignment AS a
+            WHERE t.tag_id = a.tag_id
+            RETURNING t.tag_id, t.tag_type, t.project_id, t.employee_id
+        ), synced_users AS (
+            UPDATE users AS u
+            SET tag_id = CASE
+                WHEN u.employee_id = updated_tag.employee_id THEN updated_tag.tag_id
+                ELSE NULL
+            END
+            FROM updated_tag
+            WHERE u.tag_id = updated_tag.tag_id
+               OR u.employee_id = updated_tag.employee_id
+            RETURNING u.id
+        ), closed_visits AS (
+            UPDATE visits AS v
+            SET ended_at = now(),
+                duration_sec = GREATEST(0, EXTRACT(EPOCH FROM (now() - v.started_at))::integer)
+            FROM updated_tag AS t
+            WHERE v.tag_id = t.tag_id AND v.ended_at IS NULL
+            RETURNING v.id
+        ), hardware_project AS (
+            UPDATE projects AS p
+            SET tracking_mode = 'hardware', updated_at = now()
+            FROM updated_tag AS t
+            WHERE t.tag_type = 'physical' AND p.id = t.project_id
+            RETURNING p.id
+        )
+        SELECT tag_id FROM updated_tag
+        """,
+        (
+            project_id, tag_id, tag_id,
+            project_id, employee_id, assigned_by,
+            project_id, employee_id,
+        ),
+    )
+    return get_tag(row["tag_id"]) if row else None
+
+
+def deactivate_tag(tag_id: str) -> dict[str, Any] | None:
+    return update_tag(tag_id, {"status": "disabled"})
+
+
+def get_position_by_message_id(gateway_id: str, message_id: str) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        SELECT tag_id, project_id, plan_id, x, y, zone, source, gateway_id,
+               message_id, device_ts, residual_m, anchors_used, ts
+        FROM positions
+        WHERE gateway_id = %s AND message_id = %s
+        """,
+        (gateway_id, message_id),
+    )
+
+
+def record_position_fix(
+    *,
+    tag_id: str,
+    employee_id: str | None,
+    project_id: str,
+    plan_id: str | None,
+    x: float,
+    y: float,
+    zone: str | None,
+    source: str,
+    gateway_id: str | None,
+    message_id: str | None,
+    device_ts: datetime | None,
+    residual_m: float | None,
+    anchors_used: int | None,
+    battery: float | None,
+    ts: datetime,
+    visit_key: str,
+) -> dict[str, Any] | None:
+    """Atomically persist a fix, live state, and a newly opened visit.
+
+    A gateway/message conflict makes ``inserted_position`` empty, so neither
+    the tag live state nor visit lifecycle is changed by a retry.
+    """
+    return db.fetchone(
+        """
+        WITH inserted_position AS (
+            INSERT INTO positions (
+                tag_id, project_id, plan_id, x, y, zone, source,
+                gateway_id, message_id, device_ts, residual_m, anchors_used, ts
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (gateway_id, message_id)
+                WHERE message_id IS NOT NULL
+            DO NOTHING
+            RETURNING *
+        ), updated_tag AS (
+            UPDATE tags AS t
+            SET x = p.x,
+                y = p.y,
+                battery = COALESCE(%s, t.battery),
+                last_ts = p.ts,
+                updated_at = now()
+            FROM inserted_position AS p
+            WHERE t.tag_id = p.tag_id
+              AND (t.last_ts IS NULL OR t.last_ts <= p.ts)
+            RETURNING t.tag_id
+        ), opened_visit AS (
+            INSERT INTO visits (
+                visit_key, tag_id, employee_id, project_id, plan_id,
+                started_at, deal_status, source
+            )
+            SELECT %s, p.tag_id, %s, p.project_id, p.plan_id, p.ts, '', p.source
+            FROM inserted_position AS p
+            JOIN updated_tag AS t ON t.tag_id = p.tag_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM visits AS v
+                WHERE v.tag_id = p.tag_id AND v.ended_at IS NULL
+            )
+            RETURNING visit_key
+        )
+        SELECT p.*,
+               (SELECT visit_key FROM opened_visit LIMIT 1) AS opened_visit_key
+        FROM inserted_position AS p
+        """,
+        (
+            tag_id, project_id, plan_id, x, y, zone, source,
+            gateway_id, message_id, device_ts, residual_m, anchors_used, ts,
+            battery, visit_key, employee_id,
+        ),
+    )
+
+
+def get_live_tags(rows: int = 400, since: float = 0, project_id: str | None = None) -> dict[str, Any]:
+    tags = get_tags(project_id)
     result = {
         t["tag_id"]: {
             "x": t["x"],
@@ -486,6 +829,10 @@ def get_live_tags(rows: int = 400, since: float = 0) -> dict[str, Any]:
             "on": t["on"],
             "sale_name": t["sale_name"],
             "last_ts": t["last_ts"],
+            "project_id": t["project_id"],
+            "tag_type": t["tag_type"],
+            "status": t["status"],
+            "label": t["label"],
         }
         for t in tags
     }
@@ -493,33 +840,168 @@ def get_live_tags(rows: int = 400, since: float = 0) -> dict[str, Any]:
     trail: list[dict[str, Any]] = []
     if rows > 0:
         since_dt = datetime.fromtimestamp(since, tz=timezone.utc) if since else None
-        clause = "WHERE ts > %s" if since_dt else ""
-        params = (since_dt,) if since_dt else ()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since_dt:
+            clauses.append("ts > %s")
+            params.append(since_dt)
+        if project_id:
+            clauses.append("project_id = %s")
+            params.append(project_id)
+        clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         trail_rows = db.fetchall(
-            f"SELECT tag_id, x, y, zone, ts FROM positions {clause} ORDER BY ts DESC LIMIT %s",
+            f"""
+            SELECT tag_id, project_id, plan_id, x, y, zone, source, ts
+            FROM positions {clause}
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
             (*params, rows),
         )
         trail = [
-            {"tag_id": r["tag_id"], "x": r["x"], "y": r["y"], "zone": r["zone"], "ts": to_epoch(r["ts"])}
+            {
+                "tag_id": r["tag_id"], "project_id": r["project_id"],
+                "plan_id": r["plan_id"], "x": r["x"], "y": r["y"],
+                "zone": r["zone"], "source": r["source"], "ts": to_epoch(r["ts"]),
+            }
             for r in trail_rows
         ]
 
-    return {"ok": True, "now": to_epoch(utc_now()), "tags": result, "rows": trail}
+    return {
+        "ok": True,
+        "now": to_epoch(utc_now()),
+        "project_id": project_id,
+        "tags": result,
+        "rows": trail,
+    }
 
 
 def create_project(data: dict[str, Any]) -> dict[str, Any]:
     db.execute(
         """
-        INSERT INTO projects (id, name, province, plan_id, plan_name, width_m, height_m)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO projects (
+            id, name, province, plan_id, plan_name, width_m, height_m, tracking_mode
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             data["project_id"], data["name"], data.get("province", ""),
             data.get("plan_id", ""), data.get("plan_name", ""),
             data.get("width_m", 20), data.get("height_m", 20),
+            data.get("tracking_mode", "simulation"),
         ),
     )
     return {"ok": True, "project": get_project(data["project_id"])}
+
+
+def set_project_tracking_mode(project_id: str, tracking_mode: str) -> dict[str, Any] | None:
+    row = db.execute_returning(
+        """
+        UPDATE projects
+        SET tracking_mode = %s, updated_at = now()
+        WHERE id = %s
+        RETURNING id AS project_id
+        """,
+        (tracking_mode, project_id),
+    )
+    return get_project(project_id) if row else None
+
+
+def get_project_gateways(project_id: str) -> list[dict[str, Any]]:
+    rows = db.fetchall(
+        """
+        SELECT gateway_id, project_id, status, last_seen_at, created_at, updated_at
+        FROM gateway_credentials
+        WHERE project_id = %s
+        ORDER BY gateway_id
+        """,
+        (project_id,),
+    )
+    for row in rows:
+        row["last_seen_at"] = to_epoch(row["last_seen_at"])
+        row["created_at"] = to_epoch(row["created_at"])
+        row["updated_at"] = to_epoch(row["updated_at"])
+    return rows
+
+
+def create_gateway_credential(project_id: str, gateway_id: str, key_hash: str) -> dict[str, Any] | None:
+    row = db.fetchone(
+        """
+        WITH inserted AS (
+            INSERT INTO gateway_credentials (gateway_id, project_id, key_hash, status)
+            SELECT %s, id, %s, 'active'
+            FROM projects
+            WHERE id = %s
+            RETURNING gateway_id, project_id, status, last_seen_at, created_at, updated_at
+        ), hardware_project AS (
+            UPDATE projects AS p
+            SET tracking_mode = 'hardware', updated_at = now()
+            FROM inserted AS gateway
+            WHERE p.id = gateway.project_id
+            RETURNING p.id
+        )
+        SELECT * FROM inserted
+        """,
+        (gateway_id, key_hash, project_id),
+    )
+    if row:
+        row["last_seen_at"] = to_epoch(row["last_seen_at"])
+        row["created_at"] = to_epoch(row["created_at"])
+        row["updated_at"] = to_epoch(row["updated_at"])
+    return row
+
+
+def get_gateway_credential(gateway_id: str) -> dict[str, Any] | None:
+    """Resolve which project a gateway belongs to before authenticating it.
+
+    ``key_hash`` is deliberately not returned: the comparison itself belongs to
+    :func:`gateway_key_is_valid`, so no digest travels through the API layer.
+    """
+    return db.fetchone(
+        """
+        SELECT gateway_id, project_id, status
+        FROM gateway_credentials
+        WHERE gateway_id = %s
+        """,
+        (gateway_id,),
+    )
+
+
+def gateway_key_is_valid(project_id: str, gateway_id: str, key_hash: str) -> bool:
+    return db.fetchone(
+        """
+        SELECT gateway_id
+        FROM gateway_credentials
+        WHERE gateway_id = %s AND project_id = %s
+          AND key_hash = %s AND status = 'active'
+        """,
+        (gateway_id, project_id, key_hash),
+    ) is not None
+
+
+def touch_gateway(gateway_id: str) -> None:
+    db.execute(
+        "UPDATE gateway_credentials SET last_seen_at = now(), updated_at = now() WHERE gateway_id = %s",
+        (gateway_id,),
+    )
+
+
+def revoke_gateway(project_id: str, gateway_id: str) -> dict[str, Any] | None:
+    row = db.execute_returning(
+        """
+        UPDATE gateway_credentials
+        SET status = 'revoked', updated_at = now()
+        WHERE project_id = %s AND gateway_id = %s
+        RETURNING gateway_id
+        """,
+        (project_id, gateway_id),
+    )
+    if not row:
+        return None
+    return next(
+        (gateway for gateway in get_project_gateways(project_id) if gateway["gateway_id"] == gateway_id),
+        None,
+    )
 
 
 def create_anchor(project_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -615,7 +1097,8 @@ def get_visits(q: dict[str, str]) -> list[dict[str, Any]]:
             u.first_en || ' ' || u.last_en AS sale_name,
             v.project_id, p.name AS project_name,
             v.plan_id, v.customer_id, c.name AS customer_name,
-            v.started_at, v.ended_at, v.duration_sec, v.zone, v.deal_status
+            v.started_at, v.ended_at, v.duration_sec, v.zone, v.deal_status,
+            v.source
         FROM visits v
         LEFT JOIN users u ON u.employee_id = v.employee_id
         LEFT JOIN projects p ON p.id = v.project_id
@@ -655,12 +1138,14 @@ def get_visit(key: str) -> dict[str, Any] | None:
 
     positions = db.fetchall(
         """
-        SELECT x, y, zone, ts FROM positions
-        WHERE tag_id = %s AND ts >= %s AND ts <= %s
+        SELECT x, y, zone, source, ts FROM positions
+        WHERE tag_id = %s
+          AND project_id IS NOT DISTINCT FROM %s
+          AND ts >= %s AND ts <= %s
         ORDER BY ts ASC
         LIMIT 5000
         """,
-        (row["tag_id"], start, end),
+        (row["tag_id"], row["project_id"], start, end),
     )
 
     timeline = [{"ts": to_epoch(p["ts"]), "zone": p["zone"] or "outside"} for p in positions]
@@ -724,14 +1209,17 @@ def get_open_visit(tag_id: str) -> dict[str, Any] | None:
 
 
 def start_visit(visit_key: str, tag_id: str, employee_id: str | None, project_id: str | None,
-                 plan_id: str | None, started_at: datetime) -> None:
+                 plan_id: str | None, started_at: datetime, source: str = "hardware") -> None:
     db.execute(
         """
-        INSERT INTO visits (visit_key, tag_id, employee_id, project_id, plan_id, started_at, deal_status)
-        VALUES (%s, %s, %s, %s, %s, %s, '')
+        INSERT INTO visits (
+            visit_key, tag_id, employee_id, project_id, plan_id,
+            started_at, deal_status, source
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, '', %s)
         ON CONFLICT (visit_key) DO NOTHING
         """,
-        (visit_key, tag_id, employee_id, project_id, plan_id, started_at),
+        (visit_key, tag_id, employee_id, project_id, plan_id, started_at, source),
     )
 
 
@@ -762,8 +1250,9 @@ def add_note(visit_key: str, user_id: str, body: str) -> None:
 
 def get_overview(q: dict[str, str]) -> dict[str, Any]:
     visits = get_visits(q)
-    anchors = get_anchors()
-    tags = get_tags()
+    project_id = q.get("project") or None
+    anchors = get_anchors(project_id)
+    tags = get_tags(project_id)
 
     durations = [v["duration"] for v in visits if v["duration"] is not None]
     avg_duration = sum(durations) / len(durations) if durations else 0

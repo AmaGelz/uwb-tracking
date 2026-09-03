@@ -93,35 +93,97 @@ GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
 Restart the server after changing it. Google Sign-In only logs in an
 *existing* user matched by email — it doesn't create new accounts.
 
-## Connecting real UWB hardware
+## Real hardware and simulated demo data side by side
 
-Once real anchors/tags exist:
+Real and simulated tracking coexist per project, and nothing crosses
+between them:
 
-1. Set `SIMULATOR_ENABLED=false` in `backend/.env`.
-2. Register the project's anchors via `POST /api/projects/{id}/anchors`
-   (or directly in the `anchors` table) with their real (x, y) survey
-   positions.
-3. Have your anchor gateway / tag firmware POST ranging results to
-   `POST /api/positioning/{project_id}/ingest`:
+| | tag | project | who may write |
+|---|---|---|---|
+| real | `tag_type=physical` | `tracking_mode=hardware` | a gateway key |
+| demo | `tag_type=mock` | `tracking_mode=simulation` | an admin session |
 
-   ```json
-   {
-     "tag_id": "TAG01",
-     "ranges": [
-       {"anchor_id": "A01", "distance_m": 9.85},
-       {"anchor_id": "A02", "distance_m": 9.85},
-       {"anchor_id": "A03", "distance_m": 12.73},
-       {"anchor_id": "A04", "distance_m": 12.73}
-     ]
-   }
-   ```
+`tracking.validate_tracking_policy` enforces the pairing on every fix, so
+a gateway cannot move a demo tag and the simulator cannot touch a real
+one. A project switches to `hardware` automatically the moment a physical
+tag or a gateway key is registered against it, and the simulator skips
+those projects entirely (including their anchor heartbeats, so anchor
+status reflects the real gateway).
 
-   (needs distances from at least 3 known anchors). The backend solves
-   the position via least-squares multilateration (`positioning.py`),
-   figures out which zone it landed in, records it, and keeps the
-   visit lifecycle in sync — the exact same code path
-   (`tracking.ingest_fix`) the simulator uses, so this is a drop-in
-   replacement rather than a second implementation to maintain.
+### 1. Register the hardware
+
+Anchors keep their existing route (`POST /api/projects/{id}/anchors`, or
+the plan editor) with their real surveyed (x, y). Tags are registered
+through the **จัดการแท็กและอุปกรณ์** page, or directly:
+
+```http
+POST /api/tags
+{"tag_id": "UWB-0001", "hardware_uid": "DECA-0001",
+ "tag_type": "physical", "project_id": "P900", "employee_id": "SALE001"}
+```
+
+`POST /api/tags/{tag_id}/assign` moves a tag to another project or
+another employee: the previous assignment is ended rather than
+overwritten and any visit still open is closed, so history stays
+attributed to where it was recorded. `POST /api/tags/{tag_id}/deactivate`
+retires a tag without deleting its history.
+
+### 2. Issue a gateway key
+
+```http
+POST /api/projects/P900/gateways
+{"gateway_id": "GW-P900-01"}
+```
+
+The response carries `gateway_key` **once** — only its SHA-256 digest is
+stored, so it cannot be read back later. A lost key is replaced by
+`POST /api/projects/{id}/gateways/{gateway_id}/revoke` plus a new one.
+
+### 3. Point the gateway at the ingest endpoint
+
+```http
+POST /api/uwb/ingest
+X-Gateway-Id: GW-P900-01
+X-Gateway-Key: <the key from step 2>
+
+{
+  "message_id": "GW-P900-01-000123",
+  "tag_id": "UWB-0001",
+  "device_ts": 1772668800,
+  "battery": 87,
+  "ranges": [
+    {"anchor_id": "A01", "distance_m": 9.85},
+    {"anchor_id": "A02", "distance_m": 9.85},
+    {"anchor_id": "A03", "distance_m": 12.73},
+    {"anchor_id": "A04", "distance_m": 12.73}
+  ]
+}
+```
+
+- The project comes from the credential, never from the request body.
+- Distances from at least 3 anchors known to that project are required;
+  the backend solves the position by least-squares multilateration
+  (`positioning.py`). A gateway that solves on-device may send `x`/`y`
+  (plus optional `residual_m`/`anchors_used`) instead of `ranges`.
+- `hardware_uid` may replace `tag_id` for firmware that only knows its
+  own serial number.
+- `message_id` makes retries safe: re-posting the same
+  `(gateway_id, message_id)` returns the original fix with
+  `"duplicate": true` instead of recording it twice or reopening a visit.
+- `device_ts` accepts epoch seconds or ISO-8601 and is rejected if it is
+  more than 5 minutes in the future or 15 minutes old — a broken clock or
+  a replay is not a live position.
+
+### Bench-testing without hardware
+
+`POST /api/positioning/{project_id}/ingest` still exists for that: it is
+authenticated as an admin session and accepts **mock** tags in a
+**simulation** project. Both paths converge on `tracking.ingest_fix`,
+which writes the position, the tag snapshot and the visit lifecycle in
+one statement, so there is no second implementation to keep in step.
+
+`SIMULATOR_ENABLED=false` in `backend/.env` turns the demo generator off
+altogether.
 
 ## What's implemented
 
@@ -138,8 +200,11 @@ Once real anchors/tags exist:
 - Real anchor-placement suggestion and coverage-gap analysis
   (`calculations.py`) — grid-sampled, not a fixed 4-corner guess
 - Real UWB multilateration (`positioning.py`)
-- A live-position simulator standing in for real hardware
-  (`simulator.py`)
+- A tag registry that keeps real hardware and demo data apart, with
+  assignment history, and gateway keys stored only as SHA-256 digests
+  (`tracking.py`, `queries.py`)
+- A live-position simulator standing in for real hardware, limited to
+  mock tags in simulation-mode projects (`simulator.py`)
 
 ## Project layout
 

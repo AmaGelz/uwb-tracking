@@ -84,8 +84,24 @@ function rangeQuery(extra = {}) {
   const f = toEpoch(S.filters.from, false), t = toEpoch(S.filters.to, true);
   if (f) p.set('from', f);
   if (t) p.set('to', t);
-  for (const [k, v] of Object.entries(extra)) if (v) p.set(k, v);
+  for (const key of ['province', 'project', 'plan', 'employee', 'customer']) {
+    if (S.filters[key]) p.set(key, S.filters[key]);
+  }
+  for (const [k, v] of Object.entries(extra)) {
+    if (v) p.set(k, v);
+    else p.delete(k);
+  }
   return p.toString() ? '?' + p.toString() : '';
+}
+
+function selectedProjectId() {
+  return S.filters.project || S.boot?.live_project_id || '';
+}
+
+function projectPath(path, projectId = selectedProjectId()) {
+  if (!projectId) return path;
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}project_id=${encodeURIComponent(projectId)}`;
 }
 
 const badge = on =>
@@ -112,6 +128,22 @@ const srcTag = kind => ({
 
 function emptyRow(cols, msg) {
   return `<tr class="empty-row"><td colspan="${cols}">${esc(msg)}</td></tr>`;
+}
+
+function tagTypeBadge(tag) {
+  const physical = tag.tag_type === 'physical';
+  return `<span class="badge ${physical ? 'badge-real' : 'badge-mock'}">${physical ? 'REAL' : 'MOCK'}</span>`;
+}
+
+function tagStatusBadge(tag) {
+  if (tag.status === 'disabled') return '<span class="badge badge-none">ปิดใช้งาน</span>';
+  if (!tag.last_ts) return '<span class="badge badge-wait">รอสัญญาณ</span>';
+  return badge(Boolean(tag.on));
+}
+
+function requireOk(result) {
+  if (result && result.ok !== false) return result;
+  throw new Error(result?.detail || result?.error || 'ดำเนินการไม่สำเร็จ');
 }
 
 /* -------------------------------------------------------------- floor plan */
@@ -533,9 +565,11 @@ function analyticsSection(a) {
 
 async function pageOverview() {
   const q = rangeQuery();
+  const liveProjectId = selectedProjectId();
   const isLead = S.user && (S.user.role === 'sale_lead' || S.user.role === 'admin');
   const [ov, dev, live, ana, drawing] = await Promise.all([
-    requestApi('/api/overview' + q), requestApi('/api/devices'), requestApi('/api/live?since=0'),
+    requestApi('/api/overview' + q), requestApi(projectPath('/api/devices', liveProjectId)),
+    requestApi(projectPath('/api/live?since=0', liveProjectId)),
     isLead ? requestApi('/api/analytics' + q).catch(() => null) : Promise.resolve(null),
     loadPlanDrawing().catch(() => ({})),
   ]);
@@ -605,8 +639,10 @@ async function pageOverview() {
 
 async function pageProject() {
   const q = rangeQuery();
+  const liveProjectId = selectedProjectId();
   const [live, dev, vis, drawing] = await Promise.all([
-    requestApi('/api/live?since=0'), requestApi('/api/devices'), requestApi('/api/visits' + q),
+    requestApi(projectPath('/api/live?since=0', liveProjectId)),
+    requestApi(projectPath('/api/devices', liveProjectId)), requestApi('/api/visits' + q),
     loadPlanDrawing().catch(() => ({})),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
@@ -929,45 +965,315 @@ function noteModal(key) {
   };
 }
 
-async function pageDevices() {
-  const dev = await requestApi('/api/devices');
-  render(`
-    <div class="page-head"><h1>ตั้งค่าอุปกรณ์</h1>
-      <span class="page-sub">พิกัด anchor เพิ่ม/แก้ไขผ่าน API จัดการโครงการ (สิทธิ์ admin)</span></div>
-    <div class="card"><div class="card-head">
-      <span class="card-title">Anchor Status ${srcTag('live')}</span></div>
-      <div class="card-body flush"><div class="table-wrap"><table class="data">
-        <thead><tr><th>Anchor ID</th><th class="num">Axis X</th><th class="num">Axis Y</th>
-          <th>Status</th><th>Battery</th><th>เห็นล่าสุด</th></tr></thead>
-        <tbody>${dev.anchors.length ? dev.anchors.map(a => `
-          <tr><td>${esc(a.anchor_id)}</td><td class="num axis">${m2(a.x)}</td>
-            <td class="num axis">${m2(a.y)}</td><td>${badge(a.on)}</td>
-            <td>${battery(a.battery)}</td>
-            <td class="dim">${a.last_ts ? fmtTime(a.last_ts) : 'ยังไม่เคยเห็น'}</td></tr>`).join('')
-          : emptyRow(6, 'ไม่พบ anchor')}</tbody>
-      </table></div></div>
+function projectLabel(projectId) {
+  const project = (S.boot?.projects || []).find(item => item.project_id === projectId);
+  return project?.name || projectId || 'ยังไม่กำหนด';
+}
+
+function employeeLabel(employeeId) {
+  const person = (S.boot?.people || []).find(item => item.employee_id === employeeId);
+  if (!person) return employeeId || 'ยังไม่ผูก';
+  const name = `${person.first_th || person.first_en || ''} ${person.last_th || person.last_en || ''}`.trim();
+  return name ? `${person.employee_id} — ${name}` : person.employee_id;
+}
+
+function fmtAnyTime(value) {
+  if (!value) return 'ยังไม่เคยเห็น';
+  if (typeof value === 'number') return `${fmtDate(value)} ${fmtTime(value)}`;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? `${fmtDate(parsed / 1000)} ${fmtTime(parsed / 1000)}` : '—';
+}
+
+async function reloadTagAdmin() {
+  S.boot = await requestApi('/api/bootstrap');
+  await pageDevices();
+}
+
+function tagModalBase(title, body, saveLabel = 'บันทึก') {
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tag-modal-title">
+      <div class="modal-head"><span class="modal-title" id="tag-modal-title">${esc(title)}</span>
+        <button class="x" id="tag-modal-x" type="button" aria-label="ปิด">&times;</button></div>
+      <div class="modal-body">${body}<div id="tag-modal-error"></div></div>
+      <div class="modal-foot"><button class="btn" id="tag-modal-cancel" type="button">ยกเลิก</button>
+        <button class="btn btn-primary" id="tag-modal-save" type="button">${esc(saveLabel)}</button></div>
+    </div>`;
+  document.body.appendChild(back);
+  const close = () => back.remove();
+  $('#tag-modal-x', back).onclick = close;
+  $('#tag-modal-cancel', back).onclick = close;
+  back.onclick = event => { if (event.target === back) close(); };
+  back.closeTagModal = close;
+  return back;
+}
+
+function tagProjectOptions(selected = '') {
+  return (S.boot?.projects || []).map(project => `
+    <option value="${esc(project.project_id)}" ${project.project_id === selected ? 'selected' : ''}>
+      ${esc(project.name)} · ${project.tracking_mode === 'hardware' ? 'ใช้งานจริง' : 'จำลอง'}
+    </option>`).join('');
+}
+
+function employeeOptions(selected = '') {
+  return `<option value="">ยังไม่ผูกกับพนักงาน</option>` + (S.boot?.people || [])
+    .filter(person => person.role === 'sale')
+    .map(person => `<option value="${esc(person.employee_id)}" ${person.employee_id === selected ? 'selected' : ''}>${esc(employeeLabel(person.employee_id))}</option>`)
+    .join('');
+}
+
+function openTagEditor(tag = null) {
+  const editing = Boolean(tag);
+  const projectId = tag?.project_id || S.filters.project || selectedProjectId();
+  const body = `
+    <div class="field"><label class="label" for="tag-id">Tag ID</label>
+      <input class="control" id="tag-id" maxlength="80" autocomplete="off"
+        value="${esc(tag?.tag_id || '')}" ${editing ? 'disabled' : ''} placeholder="เช่น UWB-0001"></div>
+    <div class="field"><label class="label" for="tag-label">ชื่อเรียก</label>
+      <input class="control" id="tag-label" maxlength="120" value="${esc(tag?.label || '')}" placeholder="เช่น แท็กพนักงานขาย 1"></div>
+    <div class="field"><label class="label" for="tag-hardware-uid">Hardware UID</label>
+      <input class="control" id="tag-hardware-uid" maxlength="160" autocomplete="off"
+        value="${esc(tag?.hardware_uid || '')}" placeholder="หมายเลขจากอุปกรณ์จริง (ถ้ามี)"></div>
+    <div class="field-row">
+      <div class="field"><label class="label" for="tag-type">ประเภทข้อมูล</label>
+        <select class="control" id="tag-type">
+          <option value="physical" ${tag?.tag_type !== 'mock' ? 'selected' : ''}>REAL — อุปกรณ์จริง</option>
+          <option value="mock" ${tag?.tag_type === 'mock' ? 'selected' : ''}>MOCK — ข้อมูลจำลอง</option>
+        </select></div>
+      ${editing ? '' : `<div class="field"><label class="label" for="tag-project">โครงการ</label>
+        <select class="control" id="tag-project" required>${tagProjectOptions(projectId)}</select></div>`}
     </div>
-    <div class="card"><div class="card-head">
-      <span class="card-title">Tag Status ${srcTag('live')}</span></div>
-      <div class="card-body flush"><div class="table-wrap"><table class="data">
-        <thead><tr><th>Tag ID</th><th>พนักงาน</th><th class="num">Axis X</th>
-          <th class="num">Axis Y</th><th>Status</th><th>Battery</th><th>เห็นล่าสุด</th></tr></thead>
-        <tbody>${dev.tags.length ? dev.tags.map(t => `
-          <tr><td>${esc(t.tag_id)}</td>
-            <td>${t.sale_name ? esc(t.sale_name) : '<span class="dim">ยังไม่ผูก</span>'}</td>
-            <td class="num axis">${m2(t.x)}</td><td class="num axis">${m2(t.y)}</td>
-            <td>${badge(t.on)}</td><td>${battery(t.battery)}</td>
-            <td class="dim">${t.last_ts ? fmtTime(t.last_ts) : 'ยังไม่เคยเห็น'}</td></tr>`).join('')
-          : emptyRow(7, 'ยังไม่มีแท็ก')}</tbody>
-      </table></div></div>
-      <div class="hint">การผูกแท็กกับพนักงานแก้ไขผ่านฐานข้อมูลผู้ใช้งาน (คอลัมน์ <code>tag_id</code> ในตาราง users)</div>
+    ${editing ? '' : `<div class="field"><label class="label" for="tag-employee">พนักงานผู้ถือแท็ก</label>
+      <select class="control" id="tag-employee">${employeeOptions(tag?.employee_id || '')}</select></div>`}
+    <div class="inline-note">แท็ก REAL จะเปลี่ยนโครงการที่เลือกเป็นโหมดใช้งานจริง ส่วนแท็ก MOCK จะทำงานเฉพาะในโครงการจำลอง</div>`;
+  const back = tagModalBase(editing ? `แก้ไข ${tag.tag_id}` : 'ลงทะเบียนแท็ก', body, editing ? 'บันทึกการแก้ไข' : 'ลงทะเบียน');
+  $('#tag-id', back).focus();
+  $('#tag-modal-save', back).onclick = async () => {
+    const save = $('#tag-modal-save', back);
+    const errorBox = $('#tag-modal-error', back);
+    const payload = {
+      label: $('#tag-label', back).value.trim(),
+      hardware_uid: $('#tag-hardware-uid', back).value.trim() || null,
+      tag_type: $('#tag-type', back).value,
+    };
+    if (!editing) {
+      payload.tag_id = $('#tag-id', back).value.trim().toUpperCase();
+      payload.project_id = $('#tag-project', back).value;
+      payload.employee_id = $('#tag-employee', back).value || null;
+      payload.status = 'active';
+      if (!payload.tag_id || !payload.project_id) {
+        errorBox.innerHTML = '<div class="err">กรุณากรอก Tag ID และเลือกโครงการ</div>';
+        return;
+      }
+    }
+    save.disabled = true;
+    try {
+      requireOk(await requestApi(editing ? `/api/tags/${encodeURIComponent(tag.tag_id)}` : '/api/tags', {
+        method: editing ? 'PATCH' : 'POST', body: JSON.stringify(payload),
+      }));
+      back.closeTagModal();
+      await reloadTagAdmin();
+    } catch (error) {
+      errorBox.innerHTML = `<div class="err">${esc(error.message)}</div>`;
+      save.disabled = false;
+    }
+  };
+}
+
+function openTagAssignment(tag) {
+  const body = `
+    <div class="assignment-summary"><b>${esc(tag.tag_id)}</b><span>${esc(projectLabel(tag.project_id))}</span></div>
+    <div class="field"><label class="label" for="tag-project">ย้ายไปโครงการ</label>
+      <select class="control" id="tag-project" required>${tagProjectOptions(tag.project_id)}</select></div>
+    <div class="field"><label class="label" for="tag-employee">พนักงานผู้ถือแท็ก</label>
+      <select class="control" id="tag-employee">${employeeOptions(tag.employee_id || '')}</select></div>
+    <div class="inline-note">ระบบจะปิด visit เดิม เก็บประวัติไว้กับโครงการเก่า และรอสัญญาณแรกจากโครงการใหม่</div>`;
+  const back = tagModalBase('ย้ายโครงการหรือเปลี่ยนผู้ถือ', body, 'ยืนยันการเปลี่ยน');
+  $('#tag-modal-save', back).onclick = async () => {
+    const save = $('#tag-modal-save', back);
+    const errorBox = $('#tag-modal-error', back);
+    save.disabled = true;
+    try {
+      requireOk(await requestApi(`/api/tags/${encodeURIComponent(tag.tag_id)}/assign`, {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: $('#tag-project', back).value,
+          employee_id: $('#tag-employee', back).value || null,
+        }),
+      }));
+      back.closeTagModal();
+      await reloadTagAdmin();
+    } catch (error) {
+      errorBox.innerHTML = `<div class="err">${esc(error.message)}</div>`;
+      save.disabled = false;
+    }
+  };
+}
+
+async function toggleTagStatus(tag) {
+  const activate = tag.status === 'disabled';
+  if (!activate && !window.confirm(`ปิดใช้งาน ${tag.tag_id} หรือไม่? ข้อมูลย้อนหลังจะยังคงอยู่`)) return;
+  if (activate) {
+    requireOk(await requestApi(`/api/tags/${encodeURIComponent(tag.tag_id)}`, {
+      method: 'PATCH', body: JSON.stringify({ status: 'active' }),
+    }));
+  } else {
+    requireOk(await requestApi(`/api/tags/${encodeURIComponent(tag.tag_id)}/deactivate`, { method: 'POST' }));
+  }
+  await reloadTagAdmin();
+}
+
+function openGatewayCreator(projectId) {
+  const suggested = `GW-${projectId}-01`;
+  const body = `
+    <div class="field"><label class="label" for="gateway-id">Gateway ID</label>
+      <input class="control" id="gateway-id" maxlength="100" value="${esc(suggested)}" autocomplete="off"></div>
+    <div class="inline-note">ระบบจะแสดง Gateway Key เพียงครั้งเดียว กรุณาคัดลอกไปตั้งค่าที่ Gateway แล้วเก็บไว้ในที่ปลอดภัย</div>`;
+  const back = tagModalBase(`สร้าง Gateway Key · ${projectLabel(projectId)}`, body, 'สร้าง Key');
+  $('#gateway-id', back).focus();
+  $('#tag-modal-save', back).onclick = async () => {
+    const save = $('#tag-modal-save', back);
+    const errorBox = $('#tag-modal-error', back);
+    const gatewayId = $('#gateway-id', back).value.trim();
+    if (!gatewayId) {
+      errorBox.innerHTML = '<div class="err">กรุณากรอก Gateway ID</div>';
+      return;
+    }
+    save.disabled = true;
+    try {
+      const result = requireOk(await requestApi(`/api/projects/${encodeURIComponent(projectId)}/gateways`, {
+        method: 'POST', body: JSON.stringify({ gateway_id: gatewayId }),
+      }));
+      $('.modal-body', back).innerHTML = `
+        <div class="banner"><span><b>สร้าง Gateway สำเร็จ</b><br>คัดลอก Key ตอนนี้ เพราะระบบจะไม่แสดงอีก</span></div>
+        <div class="field"><label class="label" for="gateway-key">Gateway Key</label>
+          <textarea class="control secret-output" id="gateway-key" readonly>${esc(result.gateway_key)}</textarea></div>`;
+      save.textContent = 'คัดลอก Key';
+      save.disabled = false;
+      save.onclick = async () => {
+        const key = $('#gateway-key', back).value;
+        try {
+          await navigator.clipboard.writeText(key);
+          save.textContent = 'คัดลอกแล้ว';
+        } catch (_error) {
+          $('#gateway-key', back).select();
+        }
+      };
+      $('#tag-modal-cancel', back).textContent = 'ปิด';
+      await pageDevices();
+    } catch (error) {
+      errorBox.innerHTML = `<div class="err">${esc(error.message)}</div>`;
+      save.disabled = false;
+    }
+  };
+}
+
+async function revokeGateway(projectId, gatewayId) {
+  if (!window.confirm(`เพิกถอน ${gatewayId} หรือไม่? Gateway นี้จะส่งข้อมูลไม่ได้ทันที`)) return;
+  requireOk(await requestApi(
+    `/api/projects/${encodeURIComponent(projectId)}/gateways/${encodeURIComponent(gatewayId)}/revoke`,
+    { method: 'POST' },
+  ));
+  await pageDevices();
+}
+
+async function pageDevices() {
+  if (S.user?.role !== 'admin') {
+    render('<div class="card"><div class="card-body"><div class="err">หน้านี้สำหรับผู้ดูแลระบบเท่านั้น</div></div></div>');
+    return;
+  }
+  const projectId = S.filters.project || '';
+  const tagPath = projectId ? `/api/tags?project_id=${encodeURIComponent(projectId)}` : '/api/tags';
+  const [dev, registry, gatewayRegistry] = await Promise.all([
+    requestApi(projectPath('/api/devices', projectId)),
+    requestApi(tagPath),
+    projectId
+      ? requestApi(`/api/projects/${encodeURIComponent(projectId)}/gateways`)
+      : Promise.resolve({ ok: true, gateways: [] }),
+  ]);
+  const tags = registry.tags || dev.tags || [];
+  const gateways = gatewayRegistry.gateways || [];
+  render(`
+    <div class="page-head"><div><h1>จัดการแท็กและอุปกรณ์</h1>
+      <span class="page-sub">แยกอุปกรณ์จริงออกจากข้อมูลจำลอง และผูกแท็กกับโครงการ</span></div>
+      <button class="btn btn-primary" id="tag-add" type="button">+ ลงทะเบียนแท็ก</button></div>
+    <div class="cols cols-filter-main">
+      <div class="stack">${filterCard(['province', 'project'])}</div>
+      <div class="stack">
+        <div class="card"><div class="card-head">
+          <span class="card-title">Tag Registry</span><span class="page-sub">${tags.length} แท็ก</span></div>
+          <div class="card-body flush"><div class="table-wrap"><table class="data">
+            <thead><tr><th>Tag ID</th><th>ประเภท</th><th>โครงการ</th><th>พนักงาน</th>
+              <th>Status</th><th>Battery</th><th>เห็นล่าสุด</th><th>จัดการ</th></tr></thead>
+            <tbody>${tags.length ? tags.map(tag => `
+              <tr><td><b>${esc(tag.tag_id)}</b>${tag.label ? `<div class="dim">${esc(tag.label)}</div>` : ''}</td>
+                <td>${tagTypeBadge(tag)}</td>
+                <td>${esc(projectLabel(tag.project_id))}</td>
+                <td>${tag.employee_id ? esc(employeeLabel(tag.employee_id)) : '<span class="dim">ยังไม่ผูก</span>'}</td>
+                <td>${tagStatusBadge(tag)}</td><td>${battery(tag.battery)}</td>
+                <td class="dim">${tag.last_ts ? fmtTime(tag.last_ts) : 'ยังไม่เคยเห็น'}</td>
+                <td><div class="tag-actions">
+                  <button class="btn btn-small" type="button" data-tag-edit="${esc(tag.tag_id)}">แก้ไข</button>
+                  <button class="btn btn-small" type="button" data-tag-assign="${esc(tag.tag_id)}">ย้าย/ผูก</button>
+                  <button class="btn btn-small ${tag.status === 'disabled' ? '' : 'btn-danger'}" type="button" data-tag-toggle="${esc(tag.tag_id)}">${tag.status === 'disabled' ? 'เปิดใช้' : 'ปิดใช้'}</button>
+                </div></td></tr>`).join('') : emptyRow(8, 'ยังไม่มีแท็กในระบบ')}</tbody>
+          </table></div></div>
+          <div class="hint"><b>REAL</b> รับข้อมูลจาก Gateway เท่านั้น · <b>MOCK</b> ถูกขยับโดย Simulator เฉพาะโครงการจำลอง</div>
+        </div>
+        <div class="card"><div class="card-head">
+          <span class="card-title">Anchor Status ${srcTag('live')}</span></div>
+          <div class="card-body flush"><div class="table-wrap"><table class="data">
+            <thead><tr><th>Anchor ID</th><th class="num">Axis X</th><th class="num">Axis Y</th>
+              <th>Status</th><th>Battery</th><th>เห็นล่าสุด</th></tr></thead>
+            <tbody>${dev.anchors.length ? dev.anchors.map(anchor => `
+              <tr><td>${esc(anchor.anchor_id)}</td><td class="num axis">${m2(anchor.x)}</td>
+                <td class="num axis">${m2(anchor.y)}</td><td>${badge(anchor.on)}</td>
+                <td>${battery(anchor.battery)}</td>
+                <td class="dim">${anchor.last_ts ? fmtTime(anchor.last_ts) : 'ยังไม่เคยเห็น'}</td></tr>`).join('')
+              : emptyRow(6, 'ไม่พบ anchor')}</tbody>
+          </table></div></div>
+        </div>
+        <div class="card"><div class="card-head">
+          <span class="card-title">Hardware Gateways</span>
+          ${projectId ? '<button class="btn btn-small" id="gateway-add" type="button">+ สร้าง Gateway Key</button>' : ''}</div>
+          <div class="card-body flush"><div class="table-wrap"><table class="data">
+            <thead><tr><th>Gateway ID</th><th>โครงการ</th><th>Status</th><th>ใช้งานล่าสุด</th><th>จัดการ</th></tr></thead>
+            <tbody>${!projectId ? emptyRow(5, 'เลือกโครงการก่อนสร้าง Gateway') : gateways.length ? gateways.map(gateway => `
+              <tr><td><b>${esc(gateway.gateway_id)}</b></td><td>${esc(projectLabel(gateway.project_id))}</td>
+                <td><span class="badge ${gateway.status === 'active' ? 'badge-on' : 'badge-none'}">${gateway.status === 'active' ? 'ACTIVE' : 'REVOKED'}</span></td>
+                <td class="dim">${fmtAnyTime(gateway.last_seen_at)}</td>
+                <td>${gateway.status === 'active' ? `<button class="btn btn-small btn-danger" type="button" data-gateway-revoke="${esc(gateway.gateway_id)}">เพิกถอน</button>` : '—'}</td></tr>`).join('') : emptyRow(5, 'ยังไม่มี Gateway สำหรับโครงการนี้')}</tbody>
+          </table></div></div>
+          <div class="hint">Key จะถูกเก็บเป็นค่า hash และไม่สามารถเปิดดูย้อนหลังได้ หากสูญหายให้เพิกถอนแล้วสร้างใหม่</div>
+        </div>
+      </div>
     </div>`);
+  wireFilters(pageDevices);
+  $('#tag-add').onclick = () => openTagEditor();
+  document.querySelectorAll('[data-tag-edit]').forEach(button => {
+    button.onclick = () => openTagEditor(tags.find(tag => tag.tag_id === button.dataset.tagEdit));
+  });
+  document.querySelectorAll('[data-tag-assign]').forEach(button => {
+    button.onclick = () => openTagAssignment(tags.find(tag => tag.tag_id === button.dataset.tagAssign));
+  });
+  document.querySelectorAll('[data-tag-toggle]').forEach(button => {
+    button.onclick = () => toggleTagStatus(tags.find(tag => tag.tag_id === button.dataset.tagToggle))
+      .catch(error => fatal(error));
+  });
+  const gatewayAdd = $('#gateway-add');
+  if (gatewayAdd) gatewayAdd.onclick = () => openGatewayCreator(projectId);
+  document.querySelectorAll('[data-gateway-revoke]').forEach(button => {
+    button.onclick = () => revokeGateway(projectId, button.dataset.gatewayRevoke)
+      .catch(error => fatal(error));
+  });
 }
 
 async function pageDeviceTracking() {
+  const liveProjectId = selectedProjectId();
   const [dev, live, drawing] = await Promise.all([
-    requestApi('/api/devices'),
-    requestApi('/api/live?since=0'),
+    requestApi(projectPath('/api/devices', liveProjectId)),
+    requestApi(projectPath('/api/live?since=0', liveProjectId)),
     loadPlanDrawing().catch(() => ({})),
   ]);
   const tags = Object.entries(live.tags || {}).map(([id, t]) =>
@@ -990,7 +1296,7 @@ async function pageDeviceTracking() {
               <div class="bar-value">${dev.anchors.filter(a => a.on).length} / ${dev.anchors.length}</div></div>
             <div class="bar-row" style="grid-template-columns:1fr auto;margin-top:6px">
               <div class="bar-label">แท็กออนไลน์</div>
-              <div class="bar-value">${dev.tags.filter(t => t.on).length} / ${dev.tags.length}</div></div>
+              <div class="bar-value" id="live-tag-count">${dev.tags.filter(t => t.on).length} / ${dev.tags.length}</div></div>
           </div></div>
       </div>
       <div class="stack">
@@ -1013,9 +1319,9 @@ async function pageDeviceTracking() {
             <div class="card-body flush"><div class="table-wrap"><table class="data">
               <thead><tr><th>Tag ID</th><th class="num">X</th><th class="num">Y</th>
                 <th>Status</th><th>Battery</th></tr></thead>
-              <tbody>${dev.tags.length ? dev.tags.map(t => `
+              <tbody id="live-tag-rows">${dev.tags.length ? dev.tags.map(t => `
                 <tr><td>${esc(t.tag_id)}</td><td class="num axis">${m2(t.x)}</td>
-                  <td class="num axis">${m2(t.y)}</td><td>${badge(t.on)}</td>
+                  <td class="num axis">${m2(t.y)}</td><td>${tagStatusBadge(t)}</td>
                   <td>${battery(t.battery)}</td></tr>`).join('')
                 : emptyRow(5, 'ยังไม่มีแท็ก')}</tbody>
             </table></div></div></div>
@@ -1023,7 +1329,7 @@ async function pageDeviceTracking() {
       </div>
     </div>`);
   wireFilters(pageDeviceTracking);
-  startLive();
+  startLive(liveProjectId);
 }
 
 /* ------------------------------------------------------------------ live */
@@ -1037,6 +1343,13 @@ function renderLiveSnapshot(live, channel) {
   const tags = Object.entries(live.tags || {}).map(([id, tag]) =>
     Object.assign({ tag_id: id, label: tag.sale_name || id }, tag));
   plan.innerHTML = planSVG({ ...(S.live.planDrawing || {}), tags, anchorStatus: S.live.anchorStatus || {} });
+  const count = $('#live-tag-count');
+  if (count) count.textContent = `${tags.filter(tag => tag.on).length} / ${tags.length}`;
+  const rows = $('#live-tag-rows');
+  if (rows) rows.innerHTML = tags.length ? tags.map(tag => `
+    <tr><td>${esc(tag.tag_id)}</td><td class="num axis">${m2(tag.x)}</td>
+      <td class="num axis">${m2(tag.y)}</td><td>${tagStatusBadge(tag)}</td>
+      <td>${battery(tag.battery)}</td></tr>`).join('') : emptyRow(5, 'ยังไม่มีแท็ก');
   const clock = $('#live-clock');
   if (clock) clock.textContent = `${channel} · อัปเดตล่าสุด ${fmtTime(live.now)}`;
 }
@@ -1058,7 +1371,7 @@ async function pollLiveFallback() {
   const controller = new AbortController();
   S.live.pollAbort = controller;
   try {
-    const live = await requestApi('/api/live?rows=0', { signal: controller.signal });
+    const live = await requestApi(projectPath('/api/live?rows=0', S.live.projectId), { signal: controller.signal });
     if (S.live.fallbackActive && !S.live.realtimeConnected) {
       renderLiveSnapshot(live, 'Polling fallback');
     }
@@ -1103,7 +1416,7 @@ function queueRealtimeRefresh() {
   S.live.refreshTimer = setTimeout(async () => {
     S.live.refreshTimer = null;
     try {
-      const live = await requestApi('/api/live?rows=0');
+      const live = await requestApi(projectPath('/api/live?rows=0', S.live.projectId));
       if (S.live.realtimeConnected) renderLiveSnapshot(live, 'Supabase Realtime');
     } catch (_error) {
       startFallbackPolling();
@@ -1119,10 +1432,11 @@ function connectLiveRealtime() {
   }
   if (S.live.channel) return;
 
+  const change = { event: '*', schema: 'public', table: 'tags' };
+  if (S.live.projectId) change.filter = `project_id=eq.${S.live.projectId}`;
   const channel = supabaseClient
     .channel(`uwb-live-${Date.now()}`)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'tags' }, queueRealtimeRefresh)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'positions' }, queueRealtimeRefresh);
+    .on('postgres_changes', change, queueRealtimeRefresh);
   S.live.channel = channel;
   S.live.connectTimer = setTimeout(() => {
     if (!S.live.realtimeConnected && S.live.channel === channel) {
@@ -1152,9 +1466,10 @@ function connectLiveRealtime() {
   });
 }
 
-function startLive() {
+function startLive(projectId = selectedProjectId()) {
   stopLive();
   S.live.stopped = false;
+  S.live.projectId = projectId || '';
   S.live.anchorStatus = S.live.anchorStatus || {};
   S.live.fallbackActive = false;
   S.live.pollInFlight = false;
@@ -1243,6 +1558,11 @@ async function route() {
   }
   if (head === 'signin') { location.replace('login.html'); return; }
   if (!S.boot) S.boot = await requestApi('/api/bootstrap');
+
+  if ((head === 'devices' || head === 'device-tracking') && S.user.role !== 'admin') {
+    location.hash = '#/overview';
+    return;
+  }
 
   S.route = head;
   try {

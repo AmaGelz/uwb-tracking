@@ -10,6 +10,11 @@ verify_jwt = true
 [functions.site]
 verify_jwt = false
 
+# Gateways authenticate with their own project-scoped key (x-gateway-id / x-gateway-key),
+# not a Supabase Auth JWT, so JWT verification must stay off for this function.
+[functions.uwb-ingest]
+verify_jwt = false
+
 [api]
 enabled = true
 # Port to use for the API URL.
