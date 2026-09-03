@@ -22,6 +22,7 @@ from psycopg2.extras import Json
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 import calculations
+import plan_geometry as geometry_utils
 import positioning
 import queries as q
 import tracking
@@ -126,6 +127,8 @@ class PlanCreate(PlanEditorModel):
     name: NonEmptyText
     width_m: float = Field(default=20.0, gt=0)
     height_m: float = Field(default=20.0, gt=0)
+    boundary: dict[str, Any] | list[Any] | None = None
+    ceiling_height_m: float = Field(default=3.0, gt=0)
     is_active: bool = True
     version: int = Field(default=1, ge=1)
 
@@ -134,6 +137,8 @@ class PlanUpdate(PlanEditorModel):
     name: NonEmptyText | None = None
     width_m: float | None = Field(default=None, gt=0)
     height_m: float | None = Field(default=None, gt=0)
+    boundary: dict[str, Any] | list[Any] | None = None
+    ceiling_height_m: float | None = Field(default=None, gt=0)
     is_active: bool | None = None
     version: int | None = Field(default=None, ge=1)
 
@@ -154,11 +159,26 @@ class PlanObjectUpdate(PlanEditorModel):
 
 class PlanZoneCreate(PlanEditorModel):
     name: NonEmptyText
-    geometry: dict[str, Any] | None = None
+    geometry: dict[str, Any] | list[Any] | None = None
     x_min: float | None = None
     x_max: float | None = None
     y_min: float | None = None
     y_max: float | None = None
+    zone_type: str = Field(default="general", min_length=1, max_length=100)
+    color: str = Field(default="#4F9DDE", min_length=4, max_length=9)
+    opacity: float = Field(default=0.3, ge=0, le=1)
+    is_visible: bool = True
+    stack_order: int | None = None
+
+
+class PlanZoneUpdate(PlanEditorModel):
+    name: NonEmptyText | None = None
+    geometry: dict[str, Any] | list[Any] | None = None
+    zone_type: str | None = Field(default=None, min_length=1, max_length=100)
+    color: str | None = Field(default=None, min_length=4, max_length=9)
+    opacity: float | None = Field(default=None, ge=0, le=1)
+    is_visible: bool | None = None
+    stack_order: int | None = None
 
 
 class PlanAnchorCreate(PlanEditorModel):
@@ -166,8 +186,13 @@ class PlanAnchorCreate(PlanEditorModel):
     hardware_address: str | None = Field(default=None, max_length=32)
     x: float
     y: float
-    z: float | None = None
+    z: float | None = Field(default=None, ge=0)
     mount_height_m: float | None = Field(default=None, ge=0)
+    mount_type: Literal["wall", "ceiling", "column", "free"] = "free"
+    orientation_deg: float = 0
+    wall_ref: dict[str, Any] | None = None
+    gateway_device_id: str | None = Field(default=None, max_length=100)
+    bound_tag_id: str | None = Field(default=None, max_length=100)
     battery: float | None = None
 
 
@@ -176,6 +201,16 @@ class PlanDimensionCreate(PlanEditorModel):
     y1: float
     x2: float
     y2: float
+    length_m: float | None = Field(default=None, ge=0)
+    angle_deg: float | None = None
+    label: str | None = None
+
+
+class PlanDimensionUpdate(PlanEditorModel):
+    x1: float | None = None
+    y1: float | None = None
+    x2: float | None = None
+    y2: float | None = None
     length_m: float | None = Field(default=None, ge=0)
     angle_deg: float | None = None
     label: str | None = None
@@ -253,52 +288,98 @@ def require_plan(plan_id: str) -> dict[str, Any]:
     return plan
 
 
-def normalise_zone(payload: PlanZoneCreate) -> dict[str, Any]:
-    data = payload.model_dump()
-    geometry = data.get("geometry")
-
-    if geometry is not None:
-        points = geometry.get("points")
-        if not isinstance(points, list) or len(points) < 3:
-            raise HTTPException(status_code=422, detail="geometry.points ต้องมีอย่างน้อย 3 จุด")
-
-        coordinates: list[tuple[float, float]] = []
-        for point in points:
-            if not isinstance(point, (list, tuple)) or len(point) < 2:
-                raise HTTPException(status_code=422, detail="แต่ละจุดใน geometry.points ต้องเป็น [x, y]")
-            x, y = point[0], point[1]
-            if (
-                isinstance(x, bool) or isinstance(y, bool)
-                or not isinstance(x, (int, float)) or not isinstance(y, (int, float))
-                or not math.isfinite(float(x)) or not math.isfinite(float(y))
-            ):
-                raise HTTPException(status_code=422, detail="พิกัด geometry ต้องเป็นตัวเลขที่มีค่าจำกัด")
-            coordinates.append((float(x), float(y)))
-
-        data["x_min"] = min(x for x, _y in coordinates)
-        data["x_max"] = max(x for x, _y in coordinates)
-        data["y_min"] = min(y for _x, y in coordinates)
-        data["y_max"] = max(y for _x, y in coordinates)
-    else:
-        bounds = (data.get("x_min"), data.get("x_max"), data.get("y_min"), data.get("y_max"))
-        if any(value is None for value in bounds):
-            raise HTTPException(
-                status_code=422,
-                detail="ต้องระบุ geometry หรือ x_min, x_max, y_min, y_max ให้ครบ",
+def normalise_plan_data(
+    data: dict[str, Any],
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(data)
+    boundary_supplied = result.get("boundary") is not None
+    legacy_size_supplied = "width_m" in result or "height_m" in result
+    try:
+        if boundary_supplied:
+            boundary = geometry_utils.normalise_polygon_geometry(result["boundary"])
+        elif existing is None:
+            boundary = geometry_utils.legacy_boundary(
+                result.get("width_m", 20),
+                result.get("height_m", 20),
             )
-        data["geometry"] = {
-            "type": "polygon",
-            "points": [
-                [data["x_min"], data["y_min"]],
-                [data["x_max"], data["y_min"]],
-                [data["x_max"], data["y_max"]],
-                [data["x_min"], data["y_max"]],
-            ],
-        }
+        else:
+            # Width/height are derived compatibility fields once a plan has a
+            # polygon.  A legacy update must not silently replace a freeform
+            # boundary with a rectangle.
+            boundary = geometry_utils.boundary_for_plan(existing)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if data["x_min"] >= data["x_max"] or data["y_min"] >= data["y_max"]:
-        raise HTTPException(status_code=422, detail="ขอบเขต zone ต้องมีความกว้างและความสูงมากกว่า 0")
-    return data
+    if boundary_supplied or existing is None or legacy_size_supplied:
+        fields = geometry_utils.plan_boundary_fields(boundary)
+        if fields["width_m"] <= 0 or fields["height_m"] <= 0:
+            raise HTTPException(status_code=422, detail="plan boundary must have positive width and height")
+        result.update(fields)
+    return result
+
+
+def normalise_zone_data(
+    data: dict[str, Any],
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(data)
+    geometry = result.get("geometry")
+    if geometry is not None:
+        try:
+            result["geometry"] = geometry_utils.normalise_polygon_geometry(geometry)
+            points = geometry_utils.normalise_points(result["geometry"]["points"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        bounds = geometry_utils.polygon_bounds(points)
+        result.update({key: bounds[key] for key in ("x_min", "x_max", "y_min", "y_max")})
+    elif existing is None:
+        bounds_values = (result.get("x_min"), result.get("x_max"), result.get("y_min"), result.get("y_max"))
+        if any(value is None for value in bounds_values):
+            raise HTTPException(status_code=422, detail="geometry or all zone bounds are required")
+        x_min, x_max, y_min, y_max = (float(value) for value in bounds_values)
+        try:
+            result["geometry"] = geometry_utils.polygon_geometry(geometry_utils.normalise_points([
+                (x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max),
+            ]))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    color = result.get("color")
+    if color is not None and not re.fullmatch(r"#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?", color):
+        raise HTTPException(status_code=422, detail="zone color must be a 3- or 6-digit hex color")
+    return result
+
+
+def normalise_anchor_data(plan: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    result = dict(data)
+    mount_type = result.get("mount_type") or "free"
+    height = result.get("z")
+    if height is None:
+        height = result.get("mount_height_m")
+    if height is None:
+        height = float(plan.get("ceiling_height_m") or 3.0) if mount_type == "ceiling" else 0.0
+    result["z"] = float(height)
+    result["mount_height_m"] = float(height)
+    result["orientation_deg"] = float(result.get("orientation_deg") or 0) % 360
+    if mount_type != "wall":
+        result["wall_ref"] = None
+    elif result.get("wall_ref") is not None and not isinstance(result["wall_ref"], dict):
+        raise HTTPException(status_code=422, detail="wall_ref must be an object")
+
+    gateway_id = (result.get("gateway_device_id") or "").strip() or None
+    tag_id = (result.get("bound_tag_id") or "").strip() or None
+    result["gateway_device_id"] = gateway_id
+    result["bound_tag_id"] = tag_id
+    if gateway_id:
+        owner = db.fetchone("SELECT project_id, plan_id FROM hardware_gateways WHERE device_id = %s", (gateway_id,))
+        if not owner or owner["project_id"] != plan["project_id"] or owner["plan_id"] != plan["plan_id"]:
+            raise HTTPException(status_code=422, detail="gateway device is not registered to this plan")
+    if tag_id:
+        owner = db.fetchone("SELECT project_id, plan_id FROM tags WHERE tag_id = %s", (tag_id,))
+        if not owner or owner["project_id"] != plan["project_id"] or owner["plan_id"] != plan["plan_id"]:
+            raise HTTPException(status_code=422, detail="tag is not registered to this plan")
+    return result
 
 
 def _finite_number(value: Any) -> float | None:
@@ -642,9 +723,9 @@ def bootstrap(x_session: str | None = Header(default=None)):
     )
     live_plan_id = live_plan.get("plan_id") if live_plan else None
     zones_rows = q.get_plan_zones(live_plan_id) if live_plan_id else (q.get_zones(live_id) if live_id else [])
-    zones = [{"name": z["name"], "x": [z["x_min"], z["x_max"]], "y": [z["y_min"], z["y_max"]]} for z in zones_rows]
+    zones = zones_rows
     anchors_rows = q.get_plan_anchors(live_plan_id) if live_plan_id else (q.get_anchors(live_id) if live_id else [])
-    anchors = {a["anchor_id"]: [a["x"], a["y"]] for a in anchors_rows}
+    anchors = {a["anchor_id"]: a for a in anchors_rows}
 
     return {
         "ok": True,
@@ -836,7 +917,7 @@ def plan_create(project_id: str, payload: PlanCreate, x_session: str | None = He
     require_role(x_session, {"admin"})
     if not q.get_project(project_id):
         raise HTTPException(status_code=404, detail="ไม่พบโครงการ")
-    plan = q.create_plan(project_id, payload.model_dump())
+    plan = q.create_plan(project_id, normalise_plan_data(payload.model_dump()))
     if not plan:
         raise HTTPException(status_code=409, detail="plan_id หรือชื่อแปลนซ้ำในโครงการ")
     return {"ok": True, "plan": plan}
@@ -860,6 +941,7 @@ def plan_detail(plan_id: str, x_session: str | None = Header(default=None)):
 @app.put("/api/plans/{plan_id}")
 def plan_update(plan_id: str, payload: PlanUpdate, x_session: str | None = Header(default=None)):
     require_role(x_session, {"admin"})
+    current = require_plan(plan_id)
     data = {
         key: value
         for key, value in payload.model_dump(exclude_unset=True).items()
@@ -867,8 +949,13 @@ def plan_update(plan_id: str, payload: PlanUpdate, x_session: str | None = Heade
     }
     if not data:
         raise HTTPException(status_code=400, detail="ไม่มีข้อมูลสำหรับแก้ไขแปลน")
+    normalised = normalise_plan_data(data, current)
+    if "boundary" in data and normalised.get("boundary") == current.get("boundary"):
+        # The editor submits the canonical boundary with ordinary property
+        # saves. Only a topology change should invalidate wall references.
+        normalised.pop("boundary", None)
     try:
-        plan = q.update_plan(plan_id, data)
+        plan = q.update_plan(plan_id, normalised)
     except UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="ชื่อแปลนซ้ำในโครงการ") from exc
     if not plan:
@@ -946,12 +1033,43 @@ def plan_zone_create(
     require_role(x_session, {"admin"})
     require_plan(plan_id)
     try:
-        zone = q.create_plan_zone(plan_id, normalise_zone(payload))
+        zone = q.create_plan_zone(plan_id, normalise_zone_data(payload.model_dump()))
     except UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="ชื่อ zone ซ้ำในโครงการ") from exc
     if not zone:
         raise HTTPException(status_code=404, detail="ไม่พบแปลน")
     return {"ok": True, "zone": zone}
+
+
+@app.put("/api/plans/{plan_id}/zones/{zone_id}")
+def plan_zone_update(
+    plan_id: str,
+    zone_id: int,
+    payload: PlanZoneUpdate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    existing = next((zone for zone in q.get_plan_zones(plan_id) if zone["zone_id"] == zone_id), None)
+    if not existing:
+        raise HTTPException(status_code=404, detail="zone was not found in this plan")
+    data = {key: value for key, value in payload.model_dump(exclude_unset=True).items() if value is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="no zone changes were supplied")
+    try:
+        zone = q.update_plan_zone(plan_id, zone_id, normalise_zone_data(data, existing))
+    except UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="zone name is already in use") from exc
+    return {"ok": True, "zone": zone}
+
+
+@app.delete("/api/plans/{plan_id}/zones/{zone_id}")
+def plan_zone_delete(plan_id: str, zone_id: int, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    if not q.delete_plan_zone(plan_id, zone_id):
+        raise HTTPException(status_code=404, detail="zone was not found in this plan")
+    return {"ok": True}
 
 
 @app.get("/api/plans/{plan_id}/anchors")
@@ -968,8 +1086,8 @@ def plan_anchor_create(
     x_session: str | None = Header(default=None),
 ):
     require_role(x_session, {"admin"})
-    require_plan(plan_id)
-    data = payload.model_dump()
+    plan = require_plan(plan_id)
+    data = normalise_anchor_data(plan, payload.model_dump())
     data["hardware_address"] = _normal_hardware_address(data.get("hardware_address")) or None
     try:
         anchor = q.create_plan_anchor(plan_id, data)
@@ -978,6 +1096,15 @@ def plan_anchor_create(
     if not anchor:
         raise HTTPException(status_code=404, detail="ไม่พบแปลน")
     return {"ok": True, "anchor": anchor}
+
+
+@app.delete("/api/plans/{plan_id}/anchors/{anchor_id}")
+def plan_anchor_delete(plan_id: str, anchor_id: str, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    if not q.delete_plan_anchor(plan_id, anchor_id):
+        raise HTTPException(status_code=404, detail="anchor was not found in this plan")
+    return {"ok": True}
 
 
 @app.get("/api/plans/{plan_id}/dimensions")
@@ -999,6 +1126,46 @@ def plan_dimension_create(
     if not dimension:
         raise HTTPException(status_code=404, detail="ไม่พบแปลน")
     return {"ok": True, "dimension": dimension}
+
+
+@app.put("/api/plans/{plan_id}/dimensions/{dimension_id}")
+def plan_dimension_update(
+    plan_id: str,
+    dimension_id: int,
+    payload: PlanDimensionUpdate,
+    x_session: str | None = Header(default=None),
+):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    existing = next(
+        (dimension for dimension in q.get_plan_dimensions(plan_id) if dimension["dimension_id"] == dimension_id),
+        None,
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="dimension was not found in this plan")
+    data = {key: value for key, value in payload.model_dump(exclude_unset=True).items() if value is not None}
+    merged = {**existing, **data}
+    if any(key in data for key in ("x1", "y1", "x2", "y2")):
+        # Coordinates are authoritative; do not retain stale derived values
+        # from the row when a caller updates only an endpoint.
+        if "length_m" not in data:
+            merged["length_m"] = None
+        if "angle_deg" not in data:
+            merged["angle_deg"] = None
+    normalised = normalise_dimension(PlanDimensionCreate(**merged))
+    if "label" in data:
+        normalised["label"] = data["label"]
+    dimension = q.update_plan_dimension(plan_id, dimension_id, normalised)
+    return {"ok": True, "dimension": dimension}
+
+
+@app.delete("/api/plans/{plan_id}/dimensions/{dimension_id}")
+def plan_dimension_delete(plan_id: str, dimension_id: int, x_session: str | None = Header(default=None)):
+    require_role(x_session, {"admin"})
+    require_plan(plan_id)
+    if not q.delete_plan_dimension(plan_id, dimension_id):
+        raise HTTPException(status_code=404, detail="dimension was not found in this plan")
+    return {"ok": True}
 
 
 @app.post("/api/projects/{project_id}/anchors")
@@ -1174,7 +1341,7 @@ async def hardware_ingest(request: Request):
     gateway = db.fetchone(
         """
         SELECT gateway.device_id, gateway.project_id, gateway.plan_id, gateway.enabled,
-               plan.width_m, plan.height_m
+               plan.width_m, plan.height_m, plan.boundary
         FROM hardware_gateways AS gateway
         JOIN plans AS plan ON plan.id = gateway.plan_id
         WHERE gateway.device_id = %s
@@ -1264,25 +1431,34 @@ async def hardware_ingest(request: Request):
         ]
 
     assert fix_x is not None and fix_y is not None
-    if fix_x < -2 or fix_x > gateway["width_m"] + 2 or fix_y < -2 or fix_y > gateway["height_m"] + 2:
-        raise HTTPException(status_code=422, detail="Calculated position is outside the plan boundary")
+    boundary = geometry_utils.boundary_for_plan(gateway)
+    boundary_points = geometry_utils.normalise_points(boundary["points"])
+    if not geometry_utils.point_in_polygon((fix_x, fix_y), boundary_points):
+        nearest = geometry_utils.nearest_polygon_edge((fix_x, fix_y), boundary_points)
+        if not nearest or nearest["distance"] > 2:
+            raise HTTPException(status_code=422, detail="Calculated position is outside the plan boundary")
     if residual_m is not None and residual_m > 3:
         raise HTTPException(status_code=422, detail=f"Position rejected: residual {residual_m:.3f} m is too high")
 
     zones = db.fetchall(
         """
         SELECT name, geometry, x_min, x_max, y_min, y_max
-        FROM zones WHERE project_id = %s AND plan_id = %s ORDER BY id
+        FROM zones WHERE project_id = %s AND plan_id = %s
+        ORDER BY stack_order DESC, id DESC
         """,
         (gateway["project_id"], gateway["plan_id"]),
     )
     zone = None
     for candidate in zones:
         points = (candidate.get("geometry") or {}).get("points")
-        inside = _point_in_polygon(fix_x, fix_y, points) if isinstance(points, list) and len(points) >= 3 else (
-            candidate["x_min"] <= fix_x <= candidate["x_max"]
-            and candidate["y_min"] <= fix_y <= candidate["y_max"]
-        )
+        try:
+            polygon = geometry_utils.normalise_points(points)
+            inside = geometry_utils.point_in_polygon((fix_x, fix_y), polygon)
+        except ValueError:
+            inside = (
+                candidate["x_min"] <= fix_x <= candidate["x_max"]
+                and candidate["y_min"] <= fix_y <= candidate["y_max"]
+            )
         if inside:
             zone = candidate["name"]
             break

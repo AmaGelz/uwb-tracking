@@ -26,11 +26,15 @@ def ingest_fix(tag_id: str, x: float, y: float, ts: datetime | None = None) -> d
     """
     ts = ts or utc_now()
 
-    row = db.fetchone("SELECT employee_id, project_id FROM tags WHERE tag_id = %s", (tag_id,))
+    row = db.fetchone("SELECT employee_id, project_id, plan_id FROM tags WHERE tag_id = %s", (tag_id,))
     project_id = row["project_id"] if row else None
+    plan_id = row["plan_id"] if row else None
     employee_id = row["employee_id"] if row else None
 
-    zones = q.get_zones(project_id) if project_id else []
+    if plan_id:
+        zones = list(reversed(q.get_plan_zones(plan_id)))
+    else:
+        zones = q.get_zones(project_id) if project_id else []
     zone = q.zone_for_point(zones, x, y)
 
     db.execute(
@@ -42,7 +46,7 @@ def ingest_fix(tag_id: str, x: float, y: float, ts: datetime | None = None) -> d
     open_visit = q.get_open_visit(tag_id)
     if not open_visit:
         project = q.get_project(project_id) if project_id else None
-        plan_id = project["plan_id"] if project else None
+        plan_id = plan_id or (project["plan_id"] if project else None)
         visit_key = f"V-{int(ts.timestamp())}-{tag_id}-{secrets.token_hex(3)}"
         q.start_visit(visit_key, tag_id, employee_id, project_id, plan_id, ts)
 

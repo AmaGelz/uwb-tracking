@@ -65,12 +65,41 @@ BEGIN
     IF to_regclass('supabase_import.plans') IS NOT NULL THEN
         INSERT INTO public.plans (
             id, project_id, name, width_m, height_m, is_active,
-            version, created_at, updated_at
+            version, created_at, updated_at, boundary, ceiling_height_m
         )
         SELECT
-            id, project_id, name, width_m, height_m, is_active,
-            version, created_at, updated_at
-        FROM supabase_import.plans
+            p.id, p.project_id, p.name, p.width_m, p.height_m, p.is_active,
+            p.version, p.created_at, p.updated_at,
+            COALESCE(
+                NULLIF(to_jsonb(p) -> 'boundary', 'null'::jsonb),
+                jsonb_build_object(
+                    'type', 'polygon',
+                    'points', jsonb_build_array(
+                        jsonb_build_array(0, 0), jsonb_build_array(p.width_m, 0),
+                        jsonb_build_array(p.width_m, p.height_m), jsonb_build_array(0, p.height_m)
+                    )
+                )
+            ),
+            COALESCE(NULLIF(to_jsonb(p) ->> 'ceiling_height_m', '')::double precision, 3.0)
+        FROM supabase_import.plans AS p
+        ON CONFLICT DO NOTHING;
+    END IF;
+END
+$$;
+
+-- Hardware gateways are optional in older exports, but must be restored
+-- before tags/anchors so their binding foreign keys remain valid.
+DO $$
+BEGIN
+    IF to_regclass('supabase_import.hardware_gateways') IS NOT NULL THEN
+        INSERT INTO public.hardware_gateways (
+            device_id, project_id, plan_id, description, enabled,
+            last_seen, last_message_id, created_at, updated_at
+        )
+        SELECT
+            device_id, project_id, plan_id, description, enabled,
+            last_seen, last_message_id, created_at, updated_at
+        FROM supabase_import.hardware_gateways
         ON CONFLICT DO NOTHING;
     END IF;
 END
@@ -109,29 +138,57 @@ END
 $$;
 
 INSERT INTO public.zones (
-    id, project_id, name, x_min, x_max, y_min, y_max, plan_id, geometry
+    id, project_id, name, x_min, x_max, y_min, y_max, plan_id, geometry,
+    zone_type, color, opacity, is_visible, stack_order, updated_at
 )
-SELECT id, project_id, name, x_min, x_max, y_min, y_max, plan_id, geometry
-FROM supabase_import.zones
+SELECT
+    z.id, z.project_id, z.name, z.x_min, z.x_max, z.y_min, z.y_max, z.plan_id, z.geometry,
+    COALESCE(NULLIF(to_jsonb(z) ->> 'zone_type', ''), 'general'),
+    COALESCE(NULLIF(to_jsonb(z) ->> 'color', ''), '#4F9DDE'),
+    COALESCE(NULLIF(to_jsonb(z) ->> 'opacity', '')::double precision, 0.30),
+    COALESCE(NULLIF(to_jsonb(z) ->> 'is_visible', '')::boolean, true),
+    COALESCE(NULLIF(to_jsonb(z) ->> 'stack_order', '')::integer, 0),
+    COALESCE(NULLIF(to_jsonb(z) ->> 'updated_at', '')::timestamptz, now())
+FROM supabase_import.zones AS z
+ON CONFLICT DO NOTHING;
+
+INSERT INTO public.tags (
+    id, tag_id, employee_id, project_id, x, y, battery, last_ts,
+    plan_id, z, source, device_id
+)
+SELECT
+    t.id, t.tag_id, t.employee_id, t.project_id, t.x, t.y, t.battery, t.last_ts,
+    NULLIF(to_jsonb(t) ->> 'plan_id', ''),
+    NULLIF(to_jsonb(t) ->> 'z', '')::double precision,
+    NULLIF(to_jsonb(t) ->> 'source', ''),
+    NULLIF(to_jsonb(t) ->> 'device_id', '')
+FROM supabase_import.tags AS t
 ON CONFLICT DO NOTHING;
 
 INSERT INTO public.anchors (
     id, project_id, anchor_id, x, y, battery, last_ts,
-    plan_id, z, mount_height_m
+    plan_id, z, mount_height_m, hardware_address, mount_type,
+    orientation_deg, wall_ref, gateway_device_id, bound_tag_id
 )
 SELECT
-    id, project_id, anchor_id, x, y, battery, last_ts,
-    plan_id, z, mount_height_m
-FROM supabase_import.anchors
-ON CONFLICT DO NOTHING;
-
--- Hardware-only columns added after the Supabase version are left NULL and
--- populated later by device registration / hardware ingestion.
-INSERT INTO public.tags (
-    id, tag_id, employee_id, project_id, x, y, battery, last_ts
-)
-SELECT id, tag_id, employee_id, project_id, x, y, battery, last_ts
-FROM supabase_import.tags
+    a.id, a.project_id, a.anchor_id, a.x, a.y, a.battery, a.last_ts, a.plan_id,
+    COALESCE(
+        NULLIF(to_jsonb(a) ->> 'z', '')::double precision,
+        NULLIF(to_jsonb(a) ->> 'mount_height_m', '')::double precision,
+        0
+    ),
+    COALESCE(
+        NULLIF(to_jsonb(a) ->> 'mount_height_m', '')::double precision,
+        NULLIF(to_jsonb(a) ->> 'z', '')::double precision,
+        0
+    ),
+    NULLIF(to_jsonb(a) ->> 'hardware_address', ''),
+    COALESCE(NULLIF(to_jsonb(a) ->> 'mount_type', ''), 'free'),
+    COALESCE(NULLIF(to_jsonb(a) ->> 'orientation_deg', '')::double precision, 0),
+    NULLIF(to_jsonb(a) -> 'wall_ref', 'null'::jsonb),
+    NULLIF(to_jsonb(a) ->> 'gateway_device_id', ''),
+    NULLIF(to_jsonb(a) ->> 'bound_tag_id', '')
+FROM supabase_import.anchors AS a
 ON CONFLICT DO NOTHING;
 
 INSERT INTO public.visits (
@@ -151,9 +208,21 @@ SELECT id, visit_key, user_id, body, created_at, seed_key
 FROM supabase_import.notes
 ON CONFLICT DO NOTHING;
 
-INSERT INTO public.positions (id, tag_id, x, y, zone, ts)
-SELECT id, tag_id, x, y, zone, ts
-FROM supabase_import.positions
+INSERT INTO public.positions (
+    id, tag_id, x, y, zone, ts, project_id, plan_id, z, source,
+    residual_m, anchors_used, device_id, message_id
+)
+SELECT
+    p.id, p.tag_id, p.x, p.y, p.zone, p.ts,
+    NULLIF(to_jsonb(p) ->> 'project_id', ''),
+    NULLIF(to_jsonb(p) ->> 'plan_id', ''),
+    NULLIF(to_jsonb(p) ->> 'z', '')::double precision,
+    NULLIF(to_jsonb(p) ->> 'source', ''),
+    NULLIF(to_jsonb(p) ->> 'residual_m', '')::double precision,
+    NULLIF(to_jsonb(p) ->> 'anchors_used', '')::integer,
+    NULLIF(to_jsonb(p) ->> 'device_id', ''),
+    NULLIF(to_jsonb(p) ->> 'message_id', '')
+FROM supabase_import.positions AS p
 ON CONFLICT DO NOTHING;
 
 -- Preserve imported serial/bigserial IDs without causing the next insert to

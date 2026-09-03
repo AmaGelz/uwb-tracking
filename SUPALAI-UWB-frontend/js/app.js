@@ -160,7 +160,7 @@ async function loadPlanDrawing(planId = selectedPlanId()) {
     plan: plan.plan,
     objects: objects.objects || [],
     zones: zones.zones || [],
-    anchors: Object.fromEntries((anchors.anchors || []).map(anchor => [anchor.anchor_id, [anchor.x, anchor.y]])),
+    anchors: Object.fromEntries((anchors.anchors || []).map(anchor => [anchor.anchor_id, anchor])),
     dimensions: dimensions.dimensions || [],
   })).catch(error => {
     S.planDrawingCache.delete(planId);
@@ -180,9 +180,11 @@ function planSVG(opts = {}) {
   const path = opts.path || [];
 
   let xs = [], ys = [];
+  const boundary = plan?.boundary?.points?.length >= 3
+    ? plan.boundary.points
+    : (plan ? [[0, 0], [Number(plan.width_m), 0], [Number(plan.width_m), Number(plan.height_m)], [0, Number(plan.height_m)]] : []);
   if (plan) {
-    xs.push(0, Number(plan.width_m));
-    ys.push(0, Number(plan.height_m));
+    boundary.forEach(point => { xs.push(Number(point[0])); ys.push(Number(point[1])); });
   }
   zs.forEach(z => {
     const points = z.geometry?.points || [];
@@ -198,7 +200,10 @@ function planSVG(opts = {}) {
       ys.push(Number(geometry.y), Number(geometry.y) + Number(geometry.height || 0));
     }
   });
-  Object.values(anc).forEach(p => { xs.push(p[0]); ys.push(p[1]); });
+  Object.values(anc).forEach(p => {
+    xs.push(Number(Array.isArray(p) ? p[0] : p.x));
+    ys.push(Number(Array.isArray(p) ? p[1] : p.y));
+  });
   tags.forEach(t => { if (t.x != null) { xs.push(t.x); ys.push(t.y); } });
   path.forEach(p => { xs.push(p[0]); ys.push(p[1]); });
   if (!xs.length) { xs = [0, 3]; ys = [0, 3]; }
@@ -208,10 +213,12 @@ function planSVG(opts = {}) {
   const sorted = a => a.slice().sort((p, q) => p - q);
   const qt = (a, f) => a[Math.min(a.length - 1, Math.floor(a.length * f))];
   const sx = sorted(xs), sy = sorted(ys), pad = 0.45;
-  const x0 = plan ? -pad : qt(sx, 0.01) - pad;
-  const x1 = plan ? Number(plan.width_m) + pad : qt(sx, 0.99) + pad;
-  const y0 = plan ? -pad : qt(sy, 0.01) - pad;
-  const y1 = plan ? Number(plan.height_m) + pad : qt(sy, 0.99) + pad;
+  const boundaryXs = boundary.map(point => Number(point[0]));
+  const boundaryYs = boundary.map(point => Number(point[1]));
+  const x0 = plan ? Math.min(...boundaryXs) - pad : qt(sx, 0.01) - pad;
+  const x1 = plan ? Math.max(...boundaryXs) + pad : qt(sx, 0.99) + pad;
+  const y0 = plan ? Math.min(...boundaryYs) - pad : qt(sy, 0.01) - pad;
+  const y1 = plan ? Math.max(...boundaryYs) + pad : qt(sy, 0.99) + pad;
   const W = 640, H = Math.max(260, Math.min(720, W * (y1 - y0) / (x1 - x0 || 1)));
   const X = v => (v - x0) / (x1 - x0) * W;
   const Y = v => H - (v - y0) / (y1 - y0) * H;
@@ -220,8 +227,8 @@ function planSVG(opts = {}) {
   s += `<rect x="0" y="0" width="${W}" height="${H}" fill="#fff" rx="6"/>`;
 
   if (plan) {
-    s += `<rect x="${X(0)}" y="${Y(Number(plan.height_m))}" width="${X(Number(plan.width_m)) - X(0)}"
-            height="${Y(0) - Y(Number(plan.height_m))}" fill="none" stroke="#12315f" stroke-width="1.4"/>`;
+    const planPolygon = boundary.map(point => `${X(Number(point[0]))},${Y(Number(point[1]))}`).join(' ');
+    s += `<polygon points="${planPolygon}" fill="none" stroke="#12315f" stroke-width="1.4" stroke-linejoin="round"/>`;
   }
 
   objects.forEach(object => {
@@ -239,10 +246,11 @@ function planSVG(opts = {}) {
   });
 
   zs.forEach(z => {
+    if (z.is_visible === false) return;
     const points = z.geometry?.points || [];
     if (points.length >= 3) {
       const polygon = points.map(point => `${X(Number(point[0]))},${Y(Number(point[1]))}`).join(' ');
-      s += `<polygon points="${polygon}" fill="#12315f" fill-opacity=".06" stroke="#12315f"
+      s += `<polygon points="${polygon}" fill="${esc(z.color || '#12315f')}" fill-opacity="${Number(z.opacity ?? .3)}" stroke="${esc(z.color || '#12315f')}"
               stroke-opacity=".45" stroke-dasharray="6 4"/>`;
       s += `<text x="${X(Number(points[0][0])) + 9}" y="${Y(Number(points[0][1])) + 19}" font-size="12" fill="#475467">${esc(z.name)}</text>`;
     } else {
@@ -269,11 +277,16 @@ function planSVG(opts = {}) {
   }
 
   Object.entries(anc).forEach(([id, p]) => {
-    const cx = X(p[0]), cy = Y(p[1]);
+    const px = Number(Array.isArray(p) ? p[0] : p.x);
+    const py = Number(Array.isArray(p) ? p[1] : p.y);
+    const orientation = Number(Array.isArray(p) ? 0 : p.orientation_deg || 0) * Math.PI / 180;
+    const cx = X(px), cy = Y(py);
     const on = (opts.anchorStatus || {})[id];
     const fill = on === false ? '#c8322b' : '#b5540b';
     s += `<rect x="${cx - 6}" y="${cy - 6}" width="12" height="12" fill="${fill}"
             transform="rotate(45 ${cx} ${cy})"/>`;
+    s += `<line x1="${cx}" y1="${cy}" x2="${cx + Math.cos(orientation) * 18}"
+            y2="${cy - Math.sin(orientation) * 18}" stroke="#7a5af8" stroke-width="2"/>`;
     s += `<text x="${cx + 12}" y="${cy - 9}" font-size="11" fill="#475467">${esc(id)}</text>`;
   });
 

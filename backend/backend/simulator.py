@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from config import settings
 from db import db
+import plan_geometry as geometry_utils
 import queries as q
 import tracking
 
@@ -30,7 +31,16 @@ def _pick_target(zones: list[dict]) -> tuple[float, float]:
     z = random.choice(zones)
     x_lo, x_hi = z["x_min"] + 0.3, max(z["x_max"] - 0.3, z["x_min"] + 0.3)
     y_lo, y_hi = z["y_min"] + 0.3, max(z["y_max"] - 0.3, z["y_min"] + 0.3)
-    return (random.uniform(x_lo, x_hi), random.uniform(y_lo, y_hi))
+    geometry = (z.get("geometry") or {}).get("points")
+    try:
+        polygon = geometry_utils.normalise_points(geometry)
+    except ValueError:
+        polygon = []
+    for _attempt in range(40):
+        candidate = (random.uniform(x_lo, x_hi), random.uniform(y_lo, y_hi))
+        if not polygon or geometry_utils.point_in_polygon(candidate, polygon):
+            return candidate
+    return polygon[0] if polygon else (random.uniform(x_lo, x_hi), random.uniform(y_lo, y_hi))
 
 
 def _step(x: float, y: float, target: tuple[float, float], step: float = 0.55) -> tuple[float, float]:
@@ -83,10 +93,10 @@ class Simulator:
     def _tick_once(self) -> None:
         self._tick += 1
 
-        tag_rows = db.fetchall("SELECT tag_id, project_id FROM tags WHERE project_id IS NOT NULL")
+        tag_rows = db.fetchall("SELECT tag_id, project_id, plan_id FROM tags WHERE project_id IS NOT NULL")
         for row in tag_rows:
             tag_id, project_id = row["tag_id"], row["project_id"]
-            zones = q.get_zones(project_id)
+            zones = q.get_plan_zones(row["plan_id"]) if row.get("plan_id") else q.get_zones(project_id)
 
             state = self._states.get(tag_id)
             if state is None:

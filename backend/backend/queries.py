@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from db import db
+import plan_geometry as geometry_utils
 from utils import to_epoch, utc_now
 
 WON = "ปิดการขาย"
@@ -243,9 +244,10 @@ def get_project(project_id: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------
 
 def get_plans(project_id: str) -> list[dict[str, Any]]:
-    return db.fetchall(
+    rows = db.fetchall(
         """
-        SELECT id AS plan_id, project_id, name, width_m, height_m,
+        SELECT id AS plan_id, project_id, name, width_m, height_m, boundary,
+               ceiling_height_m,
                is_active, version, created_at, updated_at
         FROM plans
         WHERE project_id = %s
@@ -253,18 +255,32 @@ def get_plans(project_id: str) -> list[dict[str, Any]]:
         """,
         (project_id,),
     )
+    return [_decorate_plan(row) for row in rows]
 
 
 def get_plan(plan_id: str) -> dict[str, Any] | None:
-    return db.fetchone(
+    row = db.fetchone(
         """
-        SELECT id AS plan_id, project_id, name, width_m, height_m,
+        SELECT id AS plan_id, project_id, name, width_m, height_m, boundary,
+               ceiling_height_m,
                is_active, version, created_at, updated_at
         FROM plans
         WHERE id = %s
         """,
         (plan_id,),
     )
+    return _decorate_plan(row) if row else None
+
+
+def _decorate_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    boundary = geometry_utils.boundary_for_plan(plan)
+    points = geometry_utils.normalise_points(boundary["points"])
+    bounds = geometry_utils.polygon_bounds(points)
+    plan["boundary"] = boundary
+    plan["width_m"] = bounds["width_m"]
+    plan["height_m"] = bounds["height_m"]
+    plan["area_m2"] = geometry_utils.polygon_area(points)
+    return plan
 
 
 def sync_project_plan(project_id: str) -> None:
@@ -294,9 +310,10 @@ def create_plan(project_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         """
         WITH inserted AS (
             INSERT INTO plans (
-                id, project_id, name, width_m, height_m, is_active, version
+                id, project_id, name, width_m, height_m, boundary,
+                ceiling_height_m, is_active, version
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
             ON CONFLICT DO NOTHING
             RETURNING *
         ), deactivated AS (
@@ -317,30 +334,39 @@ def create_plan(project_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
             WHERE i.is_active AND p.id = i.project_id
             RETURNING p.id
         )
-        SELECT id AS plan_id, project_id, name, width_m, height_m,
+        SELECT id AS plan_id, project_id, name, width_m, height_m, boundary,
+               ceiling_height_m,
                is_active, version, created_at, updated_at
         FROM inserted
         """,
         (
             data["plan_id"], project_id, data["name"],
-            data["width_m"], data["height_m"],
+            data["width_m"], data["height_m"], json.dumps(data["boundary"]),
+            data.get("ceiling_height_m", 3.0),
             data.get("is_active", False), data.get("version", 1),
         ),
     )
     if plan:
         sync_project_plan(project_id)
-    return plan
+    return _decorate_plan(plan) if plan else None
 
 
 def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    allowed = {"name", "width_m", "height_m", "is_active", "version"}
+    allowed = {
+        "name", "width_m", "height_m", "boundary", "ceiling_height_m",
+        "is_active", "version",
+    }
     changes = [(key, value) for key, value in data.items() if key in allowed]
     if not changes:
         return get_plan(plan_id)
 
-    assignments = ", ".join(f"{key} = %s" for key, _value in changes)
-    params = [value for _key, value in changes]
+    assignments = ", ".join(
+        f"{key} = %s::jsonb" if key == "boundary" else f"{key} = %s"
+        for key, _value in changes
+    )
+    params = [json.dumps(value) if key == "boundary" else value for key, value in changes]
     params.append(plan_id)
+    params.append("boundary" in dict(changes))
 
     plan = db.fetchone(
         f"""
@@ -357,6 +383,18 @@ def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
               AND p.project_id = u.project_id
               AND p.id <> u.id
             RETURNING p.id
+        ), anchor_review AS (
+            UPDATE anchors AS anchor
+                    SET wall_ref = COALESCE(anchor.wall_ref, '{{}}'::jsonb) || jsonb_build_object(
+                'needsReview', true,
+                'reviewReason', 'plan_boundary_changed'
+            )
+            FROM updated AS u
+            WHERE anchor.plan_id = u.id
+              AND anchor.mount_type = 'wall'
+              AND COALESCE(anchor.wall_ref ->> 'source', 'boundary') = 'boundary'
+              AND %s
+            RETURNING anchor.id
         ), synced_project AS (
             UPDATE projects AS p
             SET plan_id = u.id,
@@ -367,7 +405,8 @@ def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
             WHERE u.is_active AND p.id = u.project_id
             RETURNING p.id
         )
-        SELECT id AS plan_id, project_id, name, width_m, height_m,
+        SELECT id AS plan_id, project_id, name, width_m, height_m, boundary,
+               ceiling_height_m,
                is_active, version, created_at, updated_at
         FROM updated
         """,
@@ -375,7 +414,7 @@ def update_plan(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
     )
     if plan:
         sync_project_plan(plan["project_id"])
-    return plan
+    return _decorate_plan(plan) if plan else None
 
 
 def get_plan_objects(plan_id: str) -> list[dict[str, Any]]:
@@ -446,42 +485,91 @@ def delete_plan_object(plan_id: str, object_id: int) -> bool:
 
 
 def get_plan_zones(plan_id: str) -> list[dict[str, Any]]:
-    return db.fetchall(
+    rows = db.fetchall(
         """
         SELECT id AS zone_id, plan_id, project_id, name,
-               x_min, x_max, y_min, y_max, geometry
+               x_min, x_max, y_min, y_max, geometry, zone_type, color,
+               opacity, is_visible, stack_order, updated_at
         FROM zones
         WHERE plan_id = %s
-        ORDER BY id
+        ORDER BY stack_order, id
         """,
         (plan_id,),
     )
+    for row in rows:
+        try:
+            points = geometry_utils.normalise_points((row.get("geometry") or {}).get("points"))
+            row["area_m2"] = geometry_utils.polygon_area(points)
+        except ValueError:
+            row["area_m2"] = max(0.0, (row["x_max"] - row["x_min"]) * (row["y_max"] - row["y_min"]))
+    return rows
 
 
 def create_plan_zone(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
     return db.fetchone(
         """
         INSERT INTO zones (
-            project_id, plan_id, name, x_min, x_max, y_min, y_max, geometry
+            project_id, plan_id, name, x_min, x_max, y_min, y_max, geometry,
+            zone_type, color, opacity, is_visible, stack_order
         )
-        SELECT project_id, id, %s, %s, %s, %s, %s, %s::jsonb
+        SELECT project_id, id, %s, %s, %s, %s, %s, %s::jsonb,
+               %s, %s, %s, %s,
+               COALESCE(%s, (SELECT COALESCE(MAX(stack_order), 0) + 1 FROM zones WHERE plan_id = %s))
         FROM plans
         WHERE id = %s
         RETURNING id AS zone_id, plan_id, project_id, name,
-                  x_min, x_max, y_min, y_max, geometry
+                  x_min, x_max, y_min, y_max, geometry, zone_type, color,
+                  opacity, is_visible, stack_order, updated_at
         """,
         (
             data["name"], data["x_min"], data["x_max"],
-            data["y_min"], data["y_max"], json.dumps(data["geometry"]), plan_id,
+            data["y_min"], data["y_max"], json.dumps(data["geometry"]),
+            data.get("zone_type", "general"), data.get("color", "#4F9DDE"),
+            data.get("opacity", 0.3), data.get("is_visible", True),
+            data.get("stack_order"), plan_id, plan_id,
         ),
     )
+
+
+def update_plan_zone(plan_id: str, zone_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {
+        "name", "x_min", "x_max", "y_min", "y_max", "geometry",
+        "zone_type", "color", "opacity", "is_visible", "stack_order",
+    }
+    changes = [(key, value) for key, value in data.items() if key in allowed]
+    if not changes:
+        return None
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes:
+        assignments.append(f"{key} = %s::jsonb" if key == "geometry" else f"{key} = %s")
+        params.append(json.dumps(value) if key == "geometry" else value)
+    params.extend((plan_id, zone_id))
+    return db.fetchone(
+        f"""
+        UPDATE zones SET {', '.join(assignments)}, updated_at = now()
+        WHERE plan_id = %s AND id = %s
+        RETURNING id AS zone_id, plan_id, project_id, name,
+                  x_min, x_max, y_min, y_max, geometry, zone_type, color,
+                  opacity, is_visible, stack_order, updated_at
+        """,
+        tuple(params),
+    )
+
+
+def delete_plan_zone(plan_id: str, zone_id: int) -> bool:
+    return db.execute_returning(
+        "DELETE FROM zones WHERE plan_id = %s AND id = %s RETURNING id",
+        (plan_id, zone_id),
+    ) is not None
 
 
 def get_plan_anchors(plan_id: str) -> list[dict[str, Any]]:
     rows = db.fetchall(
         """
-        SELECT anchor_id, project_id, plan_id, hardware_address, x, y, z, mount_height_m,
-               battery, last_ts
+        SELECT anchor_id, project_id, plan_id, hardware_address, x, y, z,
+               mount_height_m, mount_type, orientation_deg, wall_ref,
+               gateway_device_id, bound_tag_id, battery, last_ts
         FROM anchors
         WHERE plan_id = %s
         ORDER BY anchor_id
@@ -503,9 +591,11 @@ def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | N
         """
         INSERT INTO anchors (
             project_id, plan_id, anchor_id, hardware_address, x, y, z, mount_height_m,
+            mount_type, orientation_deg, wall_ref, gateway_device_id, bound_tag_id,
             battery, last_ts
         )
-        SELECT project_id, id, %s, %s, %s, %s, %s, %s, %s, %s
+        SELECT project_id, id, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+               %s, %s, %s, %s
         FROM plans
         WHERE id = %s
         ON CONFLICT (project_id, anchor_id)
@@ -516,13 +606,21 @@ def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | N
             y = EXCLUDED.y,
             z = EXCLUDED.z,
             mount_height_m = EXCLUDED.mount_height_m,
+            mount_type = EXCLUDED.mount_type,
+            orientation_deg = EXCLUDED.orientation_deg,
+            wall_ref = EXCLUDED.wall_ref,
+            gateway_device_id = EXCLUDED.gateway_device_id,
+            bound_tag_id = EXCLUDED.bound_tag_id,
             battery = EXCLUDED.battery,
             last_ts = EXCLUDED.last_ts
         RETURNING anchor_id
         """,
         (
             data["anchor_id"], data.get("hardware_address"), data["x"], data["y"], data.get("z"),
-            data.get("mount_height_m"), data.get("battery"), utc_now(), plan_id,
+            data.get("mount_height_m"), data.get("mount_type", "free"),
+            data.get("orientation_deg", 0), json.dumps(data.get("wall_ref")) if data.get("wall_ref") else None,
+            data.get("gateway_device_id"), data.get("bound_tag_id"),
+            data.get("battery"), utc_now(), plan_id,
         ),
     )
     if not row:
@@ -531,6 +629,13 @@ def create_plan_anchor(plan_id: str, data: dict[str, Any]) -> dict[str, Any] | N
         anchor for anchor in get_plan_anchors(plan_id)
         if anchor["anchor_id"] == data["anchor_id"]
     )
+
+
+def delete_plan_anchor(plan_id: str, anchor_id: str) -> bool:
+    return db.execute_returning(
+        "DELETE FROM anchors WHERE plan_id = %s AND anchor_id = %s RETURNING id",
+        (plan_id, anchor_id),
+    ) is not None
 
 
 def get_plan_dimensions(plan_id: str) -> list[dict[str, Any]]:
@@ -565,16 +670,47 @@ def create_plan_dimension(plan_id: str, data: dict[str, Any]) -> dict[str, Any] 
     )
 
 
+def update_plan_dimension(plan_id: str, dimension_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"x1", "y1", "x2", "y2", "length_m", "angle_deg", "label"}
+    changes = [(key, value) for key, value in data.items() if key in allowed]
+    if not changes:
+        return None
+    params = [value for _key, value in changes] + [plan_id, dimension_id]
+    return db.fetchone(
+        f"""
+        UPDATE plan_dimensions
+        SET {', '.join(f'{key} = %s' for key, _value in changes)}, updated_at = now()
+        WHERE plan_id = %s AND id = %s
+        RETURNING id AS dimension_id, plan_id, x1, y1, x2, y2,
+                  length_m, angle_deg, label, created_at, updated_at
+        """,
+        tuple(params),
+    )
+
+
+def delete_plan_dimension(plan_id: str, dimension_id: int) -> bool:
+    return db.execute_returning(
+        "DELETE FROM plan_dimensions WHERE plan_id = %s AND id = %s RETURNING id",
+        (plan_id, dimension_id),
+    ) is not None
+
+
 def get_zones(project_id: str) -> list[dict[str, Any]]:
     return db.fetchall(
-        "SELECT name, x_min, x_max, y_min, y_max FROM zones WHERE project_id = %s ORDER BY id",
+        "SELECT name, x_min, x_max, y_min, y_max, geometry, plan_id, stack_order "
+        "FROM zones WHERE project_id = %s ORDER BY stack_order DESC, id DESC",
         (project_id,),
     )
 
 
 def zone_for_point(zones: list[dict[str, Any]], x: float, y: float) -> str | None:
     for z in zones:
-        if z["x_min"] <= x <= z["x_max"] and z["y_min"] <= y <= z["y_max"]:
+        try:
+            points = geometry_utils.normalise_points((z.get("geometry") or {}).get("points"))
+            inside = geometry_utils.point_in_polygon((float(x), float(y)), points)
+        except ValueError:
+            inside = z["x_min"] <= x <= z["x_max"] and z["y_min"] <= y <= z["y_max"]
+        if inside:
             return z["name"]
     return None
 
@@ -592,7 +728,8 @@ def get_anchors(project_id: str | None = None, plan_id: str | None = None) -> li
     rows = db.fetchall(
         f"""
         SELECT anchor_id, project_id, plan_id, hardware_address, x, y, z,
-               mount_height_m, battery, last_ts
+               mount_height_m, mount_type, orientation_deg, wall_ref,
+               gateway_device_id, bound_tag_id, battery, last_ts
         FROM anchors
         {where}
         ORDER BY anchor_id

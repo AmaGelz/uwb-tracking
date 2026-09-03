@@ -70,6 +70,7 @@
       <div class="tool-group" role="toolbar" aria-label="Drawing tools">
         <button class="tool-btn is-active" id="tool-select" data-tool="select" type="button" aria-pressed="true">Select</button>
         <button class="tool-btn" id="tool-line" data-tool="line" type="button" aria-pressed="false">Line / Polyline</button>
+        <button class="tool-btn tool-submode" id="tool-boundary" data-tool="boundary" type="button" aria-pressed="false">Plan Boundary</button>
         <button class="tool-btn" id="tool-rectangle" data-tool="rectangle" type="button" aria-pressed="false">Rectangle</button>
         <button class="tool-btn" id="tool-zone" data-tool="zone" type="button" aria-pressed="false">Zone</button>
         <button class="tool-btn" id="tool-anchor" data-tool="anchor" type="button" aria-pressed="false">Anchor</button>
@@ -94,9 +95,14 @@
         <button class="tool-btn precision-apply" id="precision-apply" type="submit">Add</button>
       </form>
       <div class="tool-group tool-actions" role="toolbar" aria-label="Editor actions">
+        <button class="tool-btn" id="tool-undo" type="button" title="Ctrl+Z" disabled>Undo</button>
+        <button class="tool-btn" id="tool-redo" type="button" title="Ctrl+Y / Ctrl+Shift+Z" disabled>Redo</button>
+        <button class="tool-btn" id="tool-copy" type="button" title="Ctrl+C">Copy</button>
+        <button class="tool-btn" id="tool-duplicate" type="button" title="Ctrl+D">Duplicate</button>
         <button class="tool-btn tool-danger" id="tool-delete" type="button">Delete</button>
         <button class="tool-btn is-active" id="tool-grid" type="button" aria-pressed="true">Grid</button>
         <button class="tool-btn is-active" id="tool-snap" type="button" aria-pressed="true">Snap</button>
+        <button class="tool-btn" id="tool-angle-snap" type="button" aria-pressed="false" title="Lock drawing to 45 degree increments">45°</button>
         <button class="tool-btn is-active" id="tool-labels" type="button" aria-pressed="true">Labels</button>
         <button class="tool-btn" id="tool-zoom-out" type="button" aria-label="Zoom out">−</button>
         <button class="tool-btn" id="tool-zoom-in" type="button" aria-label="Zoom in">+</button>
@@ -133,7 +139,8 @@
             <g id="object-layer"></g>
             <g id="dimension-layer"></g>
             <g id="anchor-layer"></g>
-            <g id="draft-layer" pointer-events="none"></g>
+          <g id="guide-layer" pointer-events="none"></g>
+          <g id="draft-layer"></g>
           </svg>
           <div class="editor-loading" id="editor-loading" role="status">กำลังโหลดแปลน...</div>
         </div>
@@ -161,16 +168,37 @@
             <div class="field-row">
               <label class="sub"><span>ความกว้าง</span>
                 <div class="input-with-unit">
-                  <input class="control" id="plan-width-input" type="number" min="0.01" step="0.01">
+                  <input class="control" id="plan-width-input" type="number" min="0.01" step="0.01" readonly>
                   <span>m</span>
                 </div>
               </label>
               <label class="sub"><span>ความสูง</span>
                 <div class="input-with-unit">
-                  <input class="control" id="plan-height-input" type="number" min="0.01" step="0.01">
+                  <input class="control" id="plan-height-input" type="number" min="0.01" step="0.01" readonly>
                   <span>m</span>
                 </div>
               </label>
+            </div>
+            <div class="field-row">
+              <label class="sub"><span>Ceiling height</span>
+                <div class="input-with-unit">
+                  <input class="control" id="plan-ceiling-input" type="number" min="0.01" step="0.01">
+                  <span>m</span>
+                </div>
+              </label>
+              <label class="sub"><span>Plan area</span>
+                <div class="input-with-unit">
+                  <input class="control" id="plan-area-output" readonly>
+                  <span>m²</span>
+                </div>
+              </label>
+            </div>
+            <div class="field vertex-table-field">
+              <div class="property-heading">
+                <span class="label">Boundary vertices</span>
+                <button class="btn btn-small" id="draw-boundary" type="button">Redraw</button>
+              </div>
+              <div class="vertex-table" id="plan-vertex-table"></div>
             </div>
             <div class="field-row plan-version-row">
               <label class="sub"><span>Version</span>
@@ -198,6 +226,22 @@
               <input class="control" id="anchor-hardware-input" maxlength="32" autocomplete="off" placeholder="เช่น 1782">
             </div>
             <div class="field-row">
+              <label class="sub"><span>Mount type</span>
+                <select class="control" id="anchor-mount-type-input">
+                  <option value="wall">Wall-mounted</option>
+                  <option value="ceiling">Ceiling-mounted</option>
+                  <option value="column">Column-mounted</option>
+                  <option value="free">Free-standing</option>
+                </select>
+              </label>
+              <label class="sub"><span>Orientation</span>
+                <div class="input-with-unit">
+                  <input class="control" id="anchor-orientation-input" type="number" step="1" placeholder="Auto / 0">
+                  <span>°</span>
+                </div>
+              </label>
+            </div>
+            <div class="field-row">
               <label class="sub"><span>Z</span>
                 <div class="input-with-unit">
                   <input class="control" id="anchor-z-input" type="number" step="0.01" placeholder="0.00">
@@ -211,9 +255,62 @@
                 </div>
               </label>
             </div>
+            <div class="field" id="anchor-wall-ref-field" hidden>
+              <label class="label" for="anchor-wall-ref-output">Reference wall</label>
+              <input class="control" id="anchor-wall-ref-output" readonly>
+              <label class="label" for="anchor-facing-input">Facing side</label>
+              <select class="control" id="anchor-facing-input">
+                <option value="inside">Into room</option>
+                <option value="outside">Out of room</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <label class="sub"><span>Gateway device ID</span>
+                <input class="control" id="anchor-gateway-input" maxlength="100" autocomplete="off">
+              </label>
+              <label class="sub"><span>Bound Tag ID</span>
+                <input class="control" id="anchor-tag-input" maxlength="100" autocomplete="off">
+              </label>
+            </div>
             <button class="btn btn-primary btn-block" id="save-anchor-properties" type="button" hidden>
               บันทึก Anchor properties
             </button>
+          </div>
+          <div class="inspector-section zone-settings" id="zone-settings" hidden>
+            <span class="label">Zone properties</span>
+            <div class="field">
+              <label class="label" for="zone-name-input">Zone name</label>
+              <input class="control" id="zone-name-input" maxlength="200">
+            </div>
+            <div class="field">
+              <label class="label" for="zone-type-input">Zone type</label>
+              <input class="control" id="zone-type-input" list="zone-type-options" maxlength="100">
+              <datalist id="zone-type-options">
+                <option value="waiting_area"></option>
+                <option value="storage"></option>
+                <option value="restricted_area"></option>
+                <option value="general"></option>
+              </datalist>
+            </div>
+            <div class="field-row">
+              <label class="sub"><span>Fill color</span>
+                <input class="control color-control" id="zone-color-input" type="color" value="#4F9DDE">
+              </label>
+              <label class="sub"><span>Opacity</span>
+                <input class="control" id="zone-opacity-input" type="number" min="0" max="1" step="0.05">
+              </label>
+            </div>
+            <div class="property-readout"><span>Area</span><b id="zone-area-output">0.00 m²</b></div>
+            <div class="property-readout property-readout-stack"><span>Anchors inside</span><b id="zone-anchors-output">—</b></div>
+            <button class="btn btn-primary btn-block" id="save-zone-properties" type="button">Save Zone properties</button>
+          </div>
+          <div class="inspector-section vertex-settings" id="vertex-settings" hidden>
+            <span class="label">Vertex properties</span>
+            <div class="field-row">
+              <label class="sub"><span>X</span><input class="control" id="vertex-x-input" type="number" step="0.001"></label>
+              <label class="sub"><span>Y</span><input class="control" id="vertex-y-input" type="number" step="0.001"></label>
+            </div>
+            <button class="btn btn-primary btn-block" id="save-vertex-properties" type="button">Update vertex</button>
           </div>
           <div class="inspector-section line-settings" id="line-settings" hidden>
             <span class="label">Line properties</span>
@@ -249,6 +346,13 @@
               ลงทะเบียน Gateway และ Tag กับแปลนนี้
             </button>
             <div class="hint">Hardware address ของ Anchor ต้องตรงกับค่าที่ firmware ส่ง เช่น 1782, 1783, 1784</div>
+          </div>
+          <div class="inspector-section zone-list-section">
+            <div class="property-heading">
+              <span class="label">Zones</span>
+              <span class="hint">visibility · stacking</span>
+            </div>
+            <div class="zone-list" id="zone-list"></div>
           </div>
           <div class="inspector-section">
             <label class="label" for="grid-size">Grid / Snap spacing</label>

@@ -44,7 +44,15 @@ TABLE_COLUMNS: OrderedDict[str, tuple[str, ...]] = OrderedDict(
             "plans",
             (
                 "id", "project_id", "name", "width_m", "height_m",
-                "is_active", "version", "created_at", "updated_at",
+                "boundary", "ceiling_height_m", "is_active", "version",
+                "created_at", "updated_at",
+            ),
+        ),
+        (
+            "hardware_gateways",
+            (
+                "device_id", "project_id", "plan_id", "description", "enabled",
+                "last_seen", "last_message_id", "created_at", "updated_at",
             ),
         ),
         (
@@ -65,14 +73,8 @@ TABLE_COLUMNS: OrderedDict[str, tuple[str, ...]] = OrderedDict(
             "zones",
             (
                 "id", "project_id", "name", "x_min", "x_max", "y_min",
-                "y_max", "plan_id", "geometry",
-            ),
-        ),
-        (
-            "anchors",
-            (
-                "id", "project_id", "anchor_id", "x", "y", "battery",
-                "last_ts", "plan_id", "z", "mount_height_m",
+                "y_max", "plan_id", "geometry", "zone_type", "color",
+                "opacity", "is_visible", "stack_order", "updated_at",
             ),
         ),
         (
@@ -80,6 +82,15 @@ TABLE_COLUMNS: OrderedDict[str, tuple[str, ...]] = OrderedDict(
             (
                 "id", "tag_id", "employee_id", "project_id", "x", "y",
                 "battery", "last_ts", "plan_id", "z", "source", "device_id",
+            ),
+        ),
+        (
+            "anchors",
+            (
+                "id", "project_id", "anchor_id", "x", "y", "battery",
+                "last_ts", "plan_id", "z", "mount_height_m", "hardware_address",
+                "mount_type", "orientation_deg", "wall_ref", "gateway_device_id",
+                "bound_tag_id",
             ),
         ),
         (
@@ -235,10 +246,23 @@ def copy_table(source, target, table: str) -> int:
     if not columns:
         raise RuntimeError(f"no compatible columns for {table}")
 
-    quoted_columns = ", ".join(f'"{column}"' for column in columns)
-    select_sql = f'SELECT {quoted_columns} FROM public."{table}"'
+    select_columns = list(columns)
+    insert_columns = list(columns)
+    synthesise_boundary = (
+        table == "plans"
+        and "boundary" in target_meta["columns"]
+        and "boundary" not in source_meta["columns"]
+    )
+    if synthesise_boundary:
+        insert_columns.append("boundary")
+        if "ceiling_height_m" in target_meta["columns"] and "ceiling_height_m" not in source_meta["columns"]:
+            insert_columns.append("ceiling_height_m")
+
+    quoted_select_columns = ", ".join(f'"{column}"' for column in select_columns)
+    quoted_insert_columns = ", ".join(f'"{column}"' for column in insert_columns)
+    select_sql = f'SELECT {quoted_select_columns} FROM public."{table}"'
     insert_sql = (
-        f'INSERT INTO public."{table}" ({quoted_columns}) VALUES %s '
+        f'INSERT INTO public."{table}" ({quoted_insert_columns}) VALUES %s '
         "ON CONFLICT DO NOTHING"
     )
 
@@ -251,6 +275,21 @@ def copy_table(source, target, table: str) -> int:
             rows = source_cur.fetchmany(1000)
             if not rows:
                 break
+            if synthesise_boundary:
+                width_index = select_columns.index("width_m")
+                height_index = select_columns.index("height_m")
+                converted = []
+                for row in rows:
+                    width, height = row[width_index], row[height_index]
+                    boundary = {
+                        "type": "polygon",
+                        "points": [[0, 0], [width, 0], [width, height], [0, height]],
+                    }
+                    additions: tuple[object, ...] = (psycopg2.extras.Json(boundary),)
+                    if "ceiling_height_m" in insert_columns and "ceiling_height_m" not in select_columns:
+                        additions += (3.0,)
+                    converted.append(tuple(row) + additions)
+                rows = converted
             psycopg2.extras.execute_values(
                 target_cur,
                 insert_sql,
