@@ -23,7 +23,11 @@
 create schema if not exists supalai_dashboard;
 set search_path to supalai_dashboard, public;
 
-create extension if not exists pgcrypto;
+-- No pgcrypto: the only function this schema needs from it is
+-- gen_random_uuid(), which has been in core PostgreSQL since 13, and managed
+-- Azure Database for PostgreSQL refuses the extension outright
+-- ("pgcrypto is not allow-listed for users"), which fails this whole file.
+-- Password and gateway-key hashing happens in Python, not in SQL.
 
 -- ---------------------------------------------------------
 -- Identity & access
