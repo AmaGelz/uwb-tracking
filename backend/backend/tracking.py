@@ -173,7 +173,14 @@ def ingest_fix(
             return _position_result(existing, duplicate=True)
 
     recorded_at = ts or utc_now()
-    zones = q.get_plan_zones(plan_id) if plan_id else q.get_zones(resolved_project)
+    # Prefer the plan's own zones, but fall back to the project's when the plan
+    # has none yet. Without the fallback, activating a freshly created plan
+    # before its zones are drawn silently records zone = NULL on every fix,
+    # which empties the dwell-per-zone breakdown and the zone heatmap with no
+    # error anywhere.
+    zones = q.get_plan_zones(plan_id) if plan_id else []
+    if not zones:
+        zones = q.get_zones(resolved_project)
     zone = q.zone_for_point(zones, x, y)
     visit_key = f"V-{int(recorded_at.timestamp())}-{tag_id}-{secrets.token_hex(3)}"
     stored = q.record_position_fix(

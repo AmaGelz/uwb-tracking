@@ -87,6 +87,11 @@ class LegacyBridge:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # The task may already have died of its own accident; awaiting it
+            # re-raises that. Shutdown is not the place to propagate it — doing
+            # so would skip everything the caller still has to stop.
+            logger.exception("legacy UWB bridge task ended with an error")
 
     def _detect_source(self) -> bool:
         row = self._db.fetchone(
@@ -248,4 +253,11 @@ class LegacyBridge:
                 await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            # Anything raised outside the poll loop's own handler lands here —
+            # in practice the _detect_source() probe at the top. Without this
+            # the task would end while _last_error stayed None, so /health
+            # would report a healthy bridge that is no longer running.
+            self._last_error = str(exc)
+            logger.exception("legacy UWB bridge stopped: startup detection failed")
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,8 @@ import psycopg2.extras
 import psycopg2.pool
 
 from config import settings
+
+logger = logging.getLogger("supalai.db")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCHEMA_SQL = REPO_ROOT / "database" / "schema.sql"
@@ -104,14 +108,65 @@ def seed_demo_data() -> None:
     db.script(text)
 
 
+def _remember_applied_migration(filename: str, digest: str) -> None:
+    db.execute(
+        """
+        INSERT INTO applied_migrations (filename, content_sha256, applied_at)
+        VALUES (%s, %s, now())
+        ON CONFLICT (filename)
+        DO UPDATE SET content_sha256 = EXCLUDED.content_sha256,
+                      applied_at = EXCLUDED.applied_at
+        """,
+        (filename, digest),
+    )
+
+
+def _applied_migrations() -> dict[str, str] | None:
+    """Filename -> content hash already applied, or None if unavailable.
+
+    Returning None makes the caller fall back to replaying everything, which
+    is how this worked before and is always safe.
+    """
+    try:
+        db.script(
+            """
+            CREATE TABLE IF NOT EXISTS applied_migrations (
+                filename       text PRIMARY KEY,
+                content_sha256 text NOT NULL,
+                applied_at     timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        rows = db.fetchall("SELECT filename, content_sha256 FROM applied_migrations")
+    except psycopg2.Error:
+        logger.warning("cannot track applied migrations; replaying all of them", exc_info=True)
+        return None
+    return {row["filename"]: row["content_sha256"] for row in rows}
+
+
 def apply_migrations() -> None:
     """Apply every versioned SQL migration in filename order.
 
-    The migration files are written to be idempotent, so startup can safely
-    ensure plan-editor and legacy-import structures exist without maintaining
-    a second schema-version mechanism.
+    The migration files are written to be idempotent, so startup can ensure
+    plan-editor and legacy-import structures exist without anyone maintaining
+    schema versions by hand. Replaying them unconditionally is what that
+    costs, though, and it grows: the legacy import re-scans the whole of
+    public.positions_log on every boot, inside the startup handler.
+
+    So the content of each file is hashed and recorded. A file whose hash is
+    unchanged is skipped; edit a migration and it applies again on the next
+    start, exactly as before. The first run against an existing database still
+    replays everything once, harmlessly, and records it.
     """
     if not MIGRATIONS_DIR.exists():
         return
+
+    applied = _applied_migrations()
     for migration_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        db.script(migration_file.read_text(encoding="utf-8"))
+        text = migration_file.read_text(encoding="utf-8")
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if applied is not None and applied.get(migration_file.name) == digest:
+            continue
+        db.script(text)
+        if applied is not None:
+            _remember_applied_migration(migration_file.name, digest)

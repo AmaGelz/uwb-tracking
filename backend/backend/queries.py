@@ -596,11 +596,22 @@ def create_tag(data: dict[str, Any], assigned_by: str | None = None) -> dict[str
               AND u.employee_id = inserted_tag.employee_id
             RETURNING u.id
         ), hardware_project AS (
+            -- Registering a physical tag configures the project for hardware,
+            -- but only while that cannot strand anyone: switching the mode
+            -- stops the simulator moving mock tags, so a project still running
+            -- a demo keeps its mode and the admin makes that call explicitly
+            -- (the reverse transition is guarded the same way).
             UPDATE projects AS p
             SET tracking_mode = 'hardware', updated_at = now()
             FROM inserted_tag
             WHERE inserted_tag.tag_type = 'physical'
               AND p.id = inserted_tag.project_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM tags AS mock
+                  WHERE mock.project_id = inserted_tag.project_id
+                    AND mock.tag_type = 'mock'
+                    AND mock.status = 'active'
+              )
             RETURNING p.id
         )
         SELECT tag_id FROM inserted_tag
@@ -659,7 +670,25 @@ def assign_tag(
     employee_id: str | None,
     assigned_by: str | None = None,
 ) -> dict[str, Any] | None:
-    """Replace a tag's active assignment while retaining its history."""
+    """Replace a tag's active assignment while retaining its history.
+
+    Re-confirming the assignment a tag already has is a no-op. Falling through
+    would end the active assignment, clear the live position and close the
+    in-progress visit — so simply opening the assign dialog and saving without
+    changing anything would cut a visit in half.
+    """
+    existing = get_tag(tag_id)
+    if (
+        existing
+        # An active assignment row must already exist, not merely a matching
+        # tags.project_id: a tag whose history is missing still needs one
+        # written, so that case falls through to the statement below.
+        and existing.get("assignment_id") is not None
+        and existing["project_id"] == project_id
+        and (existing.get("employee_id") or None) == (employee_id or None)
+    ):
+        return existing
+
     row = db.fetchone(
         """
         WITH candidate AS (
@@ -710,10 +739,18 @@ def assign_tag(
             WHERE v.tag_id = t.tag_id AND v.ended_at IS NULL
             RETURNING v.id
         ), hardware_project AS (
+            -- Same restraint as create_tag: do not flip a project that is
+            -- still running mock tags, or the simulator silently abandons them.
             UPDATE projects AS p
             SET tracking_mode = 'hardware', updated_at = now()
             FROM updated_tag AS t
             WHERE t.tag_type = 'physical' AND p.id = t.project_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM tags AS mock
+                  WHERE mock.project_id = t.project_id
+                    AND mock.tag_type = 'mock'
+                    AND mock.status = 'active'
+              )
             RETURNING p.id
         )
         SELECT tag_id FROM updated_tag
@@ -766,6 +803,20 @@ def record_position_fix(
 
     A gateway/message conflict makes ``inserted_position`` empty, so neither
     the tag live state nor visit lifecycle is changed by a retry.
+
+    ``opened_visit`` deliberately does not join ``updated_tag``. The tag
+    snapshot is only refreshed by a fix at least as new as the one it already
+    holds, so joining it meant an out-of-order fix — a gateway flushing a
+    queue it built while offline — recorded a position but opened no visit,
+    losing that presence from visit history. Postgres runs a data-modifying
+    CTE to completion whether or not anything selects from it, so dropping the
+    join does not stop the tag update.
+
+    The ``NOT EXISTS`` guard is not proof against a concurrent opener; it is
+    not written as ``ON CONFLICT (tag_id) WHERE ended_at IS NULL`` on purpose,
+    because ``database/schema.sql`` skips creating that partial unique index
+    when duplicate open visits already exist, and naming an absent arbiter
+    fails every ingest rather than only the rare race.
     """
     return db.fetchone(
         """
@@ -800,7 +851,6 @@ def record_position_fix(
             )
             SELECT %s, p.tag_id, %s, p.project_id, p.plan_id, p.ts, '', p.source
             FROM inserted_position AS p
-            JOIN updated_tag AS t ON t.tag_id = p.tag_id
             WHERE NOT EXISTS (
                 SELECT 1 FROM visits AS v
                 WHERE v.tag_id = p.tag_id AND v.ended_at IS NULL
