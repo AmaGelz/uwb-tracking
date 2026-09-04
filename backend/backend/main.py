@@ -1185,13 +1185,15 @@ async def hardware_ingest(request: Request):
         raise HTTPException(status_code=403, detail="Gateway is not registered or is disabled")
 
     registered_tag = db.fetchone(
-        "SELECT tag_id, project_id FROM tags WHERE tag_id = %s",
+        "SELECT tag_id, project_id, tag_type FROM tags WHERE tag_id = %s",
         (tag_id,),
     )
     if not registered_tag:
         raise HTTPException(status_code=404, detail="Tag is not registered")
     if registered_tag["project_id"] and registered_tag["project_id"] != gateway["project_id"]:
         raise HTTPException(status_code=422, detail="Tag belongs to a different project")
+    if registered_tag["tag_type"] == "mock":
+        raise HTTPException(status_code=422, detail="Mock tags cannot report through hardware ingest")
 
     measured_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     if payload.get("measured_at"):
