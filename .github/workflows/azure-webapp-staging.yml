@@ -14,7 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AZURE_WEBAPP_NAME: uwbtrackingtest
+  # A separate Web App, not a slot of uwbtrackingtest: the App Service Plan
+  # backing uwbtrackingtest is Free/Basic tier, which does not support
+  # deployment slots. A standalone Free-tier app gets us the same "click
+  # through a real Azure URL before merging" result without an upgrade.
+  AZURE_WEBAPP_NAME: uwbtrackingtest-staging
   PYTHON_VERSION: "3.12"
 
 jobs:
@@ -42,11 +46,10 @@ jobs:
       - name: Create clean deployment package
         run: git archive --format=zip --output="release-${GITHUB_SHA}.zip" HEAD
 
-      - name: Deploy to Azure Web App staging slot
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          slot-name: staging
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_STAGING }}
           package: release-${{ github.sha }}.zip
 
@@ -54,4 +57,4 @@ jobs:
         run: |
           curl --fail --silent --show-error \
             --retry 24 --retry-delay 10 --retry-all-errors \
-            "https://${{ env.AZURE_WEBAPP_NAME }}-staging.azurewebsites.net/health"
+            "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/health"
