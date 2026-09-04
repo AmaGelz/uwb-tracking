@@ -1,7 +1,7 @@
 # SUPALAI-UWB Backend
 
 FastAPI backend for the SUPALAI Tracking dashboard. Talks directly to
-Postgres (a Supabase project, or any Postgres) — no SQLite involved.
+PostgreSQL through psycopg2 — no Supabase or SQLite runtime is involved.
 
 ## 1. Install
 
@@ -14,20 +14,14 @@ pip install -r requirements.txt
 
 ## 2. Point it at a database
 
-You need a **Postgres connection string**, not just the Supabase
-project's URL/anon key (those are for the REST/PostgREST API — see
-`supabase_main.py` for that path — and can't open a raw SQL connection
-on their own).
-
-Get it from **Supabase dashboard → Project Settings → Database →
-Connection string → URI**. Use the "Transaction pooler" URI (port
-`6543`) — it plays nicely with the connection pool this backend keeps
-open.
+Use a PostgreSQL connection string supplied by the selected database host.
+The database account must be able to create/alter the application tables when
+the schema migration runs.
 
 Put it in `backend/.env`:
 
 ```env
-DATABASE_URL=postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-REGION.pooler.supabase.com:6543/postgres
+DATABASE_URL=postgresql://app_user:strong-password@db.example.internal:5432/supalai
 ```
 
 Then create the schema (and load demo data):
@@ -41,8 +35,8 @@ python migration/migration.py --seed
 pulling schema changes. See `--help` for options, including
 `--from-sqlite` if you have a prior SQLite deployment to bring over.
 
-**No Supabase project yet / just want to try it locally?** Leave
-`DATABASE_URL` empty in `backend/.env`. The backend falls back to
+For local development, leave `DATABASE_URL` empty in `backend/.env`. The
+backend falls back to
 `postgresql://postgres:postgres@127.0.0.1:5432/supalai_test` and will
 create its own schema + seed data on first boot, as long as a local
 Postgres is reachable there.

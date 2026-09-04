@@ -23,8 +23,8 @@ def _legacy_ingest_fix(tag_id: str, x: float, y: float, ts: datetime | None = No
     row, an updated `tags` row, and — if this is the first fix after the
     tag was away — a newly opened `visits` row (closed later, once the tag
     goes quiet, by `sweep_stale_visits`). Both the demo simulator and the
-    real hardware ingestion endpoint (`POST /api/positioning/{project}/ingest`)
-    call this, so the logic only has to be right once.
+    real hardware ingestion endpoint (`POST /api/uwb/ingest`) call this, so
+    the logic only has to be right once.
     """
     ts = ts or utc_now()
 

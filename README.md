@@ -8,11 +8,11 @@ live floor-plan positions, per-visit dwell/timeline, and sales analytics
 SUPALAI-UWB/
 ├── SUPALAI-UWB-frontend/   Static frontend (no build step) — vanilla JS/HTML/CSS
 ├── backend/backend/        FastAPI backend — see backend/README.md
-├── database/                schema.sql + seed.sql (PostgreSQL / Supabase)
+├── database/                schema.sql + seed.sql (PostgreSQL)
 ├── migration/migration.py   applies schema/seed to a Postgres database
 ├── data/config/              legacy reference JSON (see note below — no longer read by the app)
 ├── hardware/anchor, hardware/tag   placeholders for real UWB firmware (not yet implemented — see note below)
-└── .env                      Supabase project URL/key
+└── backend/.env              database and FastAPI runtime settings
 ```
 
 ## Quickstart
@@ -42,9 +42,8 @@ the Microsoft Store one — see
 starts throwing `Unable to create process using
 '...WindowsApps\PythonSoftwareFoundation...'`.
 
-Put a Postgres connection string in `backend/.env` as `DATABASE_URL`
-(Supabase dashboard → Project Settings → Database → Connection string
-→ URI — see the comment in `backend/.env` for details), then:
+Put the PostgreSQL connection string from your database provider in
+`backend/.env` as `DATABASE_URL`, then:
 
 ```bash
 cd ..
@@ -58,8 +57,8 @@ directly, so there's nothing else to run. Sign in with
 `admin@supalai.com` / `1234` (see `backend/README.md` for the other
 demo accounts and what each role can see).
 
-No Supabase project yet? Leave `DATABASE_URL` empty and the backend
-falls back to a local Postgres at `127.0.0.1:5432/supalai_test`,
+For local development, leave `DATABASE_URL` empty and the backend falls back
+to PostgreSQL at `127.0.0.1:5432/supalai_test`,
 creating its own schema and demo data on first boot.
 
 ## Troubleshooting (Windows)
@@ -84,35 +83,11 @@ python.exe to PATH"), delete the broken `.venv`, and recreate it with
 the Store alias. `.venv/pyvenv.cfg`'s `home`/`executable` lines should
 point under `AppData\Local\Programs\Python\...`, never `WindowsApps`.
 
-**`psycopg2.OperationalError: could not translate host name "db.<ref>.supabase.co"`**
-Supabase's direct connection (`db.<ref>.supabase.co:5432`) is
-IPv6-only on many projects now, and most Windows networks can't route
-it. Use the **pooler** connection string instead — Supabase dashboard
-→ Project Settings → Database → Connection string → **Transaction
-pooler** tab (port `6543`, host
-`aws-0-<region>.pooler.supabase.com`, username `postgres.<project-ref>`).
-
-**Connection still fails after switching to the pooler string**
-Check the password wasn't copied with the placeholder's brackets still
-attached — `[YOUR-PASSWORD]` becomes `your-actual-password`, not
-`[your-actual-password]`.
-
-**`psycopg2.errors.UndefinedColumn: column "id" referenced in foreign key constraint does not exist` during migration**
-Something already exists in the Supabase project's `public` schema
-with a different shape than `schema.sql` expects — every table uses
-`create table if not exists`, so a mismatched leftover table gets
-skipped instead of fixed, and whatever references it fails. If the
-project is dedicated to this app and has nothing else worth keeping,
-reset it in the Supabase SQL editor:
-
-```sql
-drop schema public cascade;
-create schema public;
-grant all on schema public to postgres;
-grant all on schema public to public;
-```
-
-then re-run `python migration/migration.py --seed`.
+**PostgreSQL connection fails**
+Check that the host is reachable from this machine, the port is open, the
+database exists, and the username/password in `DATABASE_URL` are URL-encoded
+when they contain reserved characters. Do not leave example brackets around
+the real password.
 
 **`PermissionError: [WinError 5] Access is denied` right after `Started reloader process ... using WatchFiles`**
 `uvicorn`'s `--reload` (tied to `DEBUG` in `backend/.env`) spawns a
@@ -123,7 +98,7 @@ or with certain antivirus/endpoint software. `DEBUG` only controls
 this reload behavior and nothing else, so setting `DEBUG=false` in
 `backend/.env` sidesteps it with no other side effects.
 
-## Database: Supabase / PostgreSQL
+## Database: PostgreSQL
 
 `database/schema.sql` is the full schema (idempotent — safe to re-run).
 `database/seed.sql` is ~3 weeks of synthetic demo visits across two
@@ -131,15 +106,11 @@ sales reps so the analytics views have something real to show
 immediately. Both get applied automatically every time the backend
 starts, and can also be applied manually via `migration/migration.py`.
 
-The backend connects with `psycopg2` directly against Postgres rather
-than through the Supabase REST client — the analytics endpoints need
-real SQL joins/aggregations that are awkward over PostgREST. Row Level
-Security is enabled on every table with no policies attached, so if
-`SUPABASE_URL`/`SUPABASE_KEY` (the anon key in root `.env`) is ever
-used directly with `supabase-js`, it returns zero rows rather than
-leaking data — all access control lives in the backend.
+The backend connects to PostgreSQL with `psycopg2`. Authentication,
+role checks and per-sale data scoping are enforced by FastAPI; browsers never
+receive database credentials and never connect to PostgreSQL directly.
 
-## No physical UWB hardware yet
+## Real hardware and simulated projects
 
 `hardware/anchor/` and `hardware/tag/` are placeholders — writing
 actual firmware needs to know the specific hardware (which UWB chip,
@@ -158,10 +129,9 @@ this project doesn't currently specify. In the meantime:
   switches that one project to hardware mode.
 - Gateways authenticate with a project-scoped key issued from the
   **จัดการแท็กและอุปกรณ์** admin page — shown once, stored only as a
-  SHA-256 digest — and post to `POST /api/uwb/ingest` (FastAPI) or the
-  `uwb-ingest` Edge Function (Supabase). Both paths solve the position
-  with the same multilateration code, deduplicate retries by
-  `message_id`, and keep the visit lifecycle in sync. See
+  SHA-256 digest — and post to FastAPI at `POST /api/uwb/ingest`.
+  The backend solves the position, deduplicates retries by `message_id`,
+  and keeps the visit lifecycle in sync. See
   `backend/README.md` → "Real hardware and simulated demo data side by
   side".
 

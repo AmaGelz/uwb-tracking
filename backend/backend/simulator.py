@@ -47,12 +47,9 @@ class Simulator:
     visit history, and analytics have real, moving data to show without
     physical UWB hardware connected.
 
-    Disable with SIMULATOR_ENABLED=false in backend/.env once real
-    anchors/tags are wired up. Real fixes come in through
-    POST /api/positioning/{project_id}/ingest instead, which goes through
-    the exact same tracking.ingest_fix() path this simulator uses — so
-    turning this off and pointing real hardware at that endpoint is a
-    drop-in swap, not a rewrite.
+    The simulator selects only mock tags in simulation projects, so it can run
+    alongside real hardware projects. Physical tag fixes enter through
+    POST /api/uwb/ingest; both sources use the same tracking.ingest_fix() path.
     """
 
     def __init__(self) -> None:
@@ -121,13 +118,24 @@ class Simulator:
                     and random.random() < 1 / 8):
                 state.target = _pick_target(zones)
 
-            tracking.ingest_fix(
-                tag_id,
-                round(state.x, 3),
-                round(state.y, 3),
-                project_id=project_id,
-                source="simulator",
-            )
+            try:
+                tracking.ingest_fix(
+                    tag_id,
+                    round(state.x, 3),
+                    round(state.y, 3),
+                    project_id=project_id,
+                    source="simulator",
+                )
+            except tracking.TrackingPolicyError as exc:
+                # The tag stopped being simulator-owned between the query above
+                # and this write — an admin retyped it or switched the project
+                # to hardware. That is the policy working, not a loop failure,
+                # so drop this tag and keep the rest of the demo moving.
+                # Without this, the exception would escape _tick_once and end
+                # _run's loop for good (start() will not restart a finished task).
+                logger.info("simulator skipping %s: %s", tag_id, exc)
+                self._states.pop(tag_id, None)
+                continue
 
             state.present_ticks_left -= 1
             if state.present_ticks_left <= 0:

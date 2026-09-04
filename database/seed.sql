@@ -1,5 +1,5 @@
 -- =========================================================
--- SUPALAI-UWB — demo/seed data (PostgreSQL / Supabase)
+-- SUPALAI-UWB — demo/seed data (PostgreSQL)
 -- =========================================================
 -- Generated deterministically; safe to re-run (ON CONFLICT DO NOTHING).
 -- Demo accounts (password for all: 1234):
@@ -8,6 +8,8 @@
 --   mandee.jai@supalai.com (role: sale, tag TAG01)
 --   somchai.d@supalai.com  (role: sale, tag TAG02)
 -- =========================================================
+
+SET search_path TO supalai_dashboard, public;
 
 -- ---------------------------------------------------- users
 INSERT INTO users (id, employee_id, email, password_hash, role, position, first_th, last_th, first_en, last_en, phone, tag_id) VALUES ('u-admin', 'ADMIN001', 'admin@supalai.com', 'pbkdf2_sha256$120000$d2b6b6f2c1e94a2c9b6e4f7a10b2c344$f0c24f4ada126701585ba7ce471d5f454778aaf345e1f6c10922bc34b31fb958', 'admin', 'Administrator', 'ผู้ดูแล', 'ระบบ', 'Admin', 'SUPALAI', '020000001', NULL) ON CONFLICT (id) DO NOTHING;

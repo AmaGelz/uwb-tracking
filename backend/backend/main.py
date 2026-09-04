@@ -19,7 +19,8 @@ import positioning
 import queries as q
 import tracking
 from config import settings
-from db import db, init_db, seed_demo_data
+from db import apply_migrations, db, init_db, seed_demo_data
+from legacy_bridge import LegacyBridge
 from live_hub import LiveHub, session_token_from_protocol_header
 from security import create_token, password_verify, public_user
 from simulator import simulator
@@ -27,6 +28,12 @@ from utils import utc_now
 
 
 live_hub = LiveHub(lambda: q.get_live_tags(rows=0), interval=0.25)
+legacy_bridge = LegacyBridge(
+    db,
+    tracking.ingest_fix,
+    poll_interval=settings.legacy_bridge_poll_seconds,
+    batch_size=settings.legacy_bridge_batch_size,
+)
 
 app = FastAPI(
     title=settings.app_name,
@@ -454,14 +461,18 @@ def _query_params(province, project, plan, employee, customer, from_date, to_dat
 async def startup() -> None:
     init_db()
     seed_demo_data()
+    apply_migrations()
     live_hub.start()
     if settings.simulator_enabled:
         simulator.start()
+    if settings.legacy_bridge_enabled:
+        legacy_bridge.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     simulator.stop()
+    await legacy_bridge.stop()
     await live_hub.stop()
 
 
@@ -472,6 +483,10 @@ def health():
         "service": "supalai-tracking-api",
         "database": "postgres",
         "simulator": settings.simulator_enabled,
+        "legacy_bridge": {
+            "enabled": settings.legacy_bridge_enabled,
+            **legacy_bridge.status(),
+        },
         "time": utc_now().isoformat(),
     }
 

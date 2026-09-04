@@ -33,7 +33,7 @@ NOW = datetime(2026, 8, 19, 9, 0, 0, tzinfo=timezone.utc)
 
 lines = []
 lines.append("-- =========================================================")
-lines.append("-- SUPALAI-UWB — demo/seed data (PostgreSQL / Supabase)")
+lines.append("-- SUPALAI-UWB — demo/seed data (PostgreSQL)")
 lines.append("-- =========================================================")
 lines.append("-- Generated deterministically; safe to re-run (ON CONFLICT DO NOTHING).")
 lines.append("-- Demo accounts (password for all: 1234):")

@@ -1,4 +1,12 @@
-# Supabase production backend
+# Legacy Supabase adapter (not used)
+
+The active application no longer uses Supabase. FastAPI, PostgreSQL sessions,
+the `/api/uwb/ingest` gateway endpoint and `/ws/live` are the supported
+runtime. Do not run the deployment commands below for the current system; this
+directory is retained only as migration history while the non-Supabase rollout
+is verified.
+
+## Historical documentation
 
 Production uses project `supalai-tracking` for PostgreSQL, Auth, Realtime, the
 `api` and `uwb-ingest` Edge Functions and the public `site` Storage bucket. The

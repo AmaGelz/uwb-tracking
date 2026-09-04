@@ -1,5 +1,7 @@
 BEGIN;
 
+SET LOCAL search_path TO supalai_dashboard, public;
+
 -- Phase 1: plan editor storage.
 -- This migration is safe to re-run and deliberately keeps every legacy column
 -- and row. Legacy rectangle zones are copied into geometry, not replaced.

@@ -15,7 +15,7 @@
 (() => {
 const {
   api: requestApi,
-  supabase: supabaseClient,
+  websocketUrl,
   state: S,
   OfflineError,
 } = window.SUPALAI_API;
@@ -1284,7 +1284,7 @@ async function pageDeviceTracking() {
 
   render(`
     <div class="page-head"><h1>ติดตามอุปกรณ์</h1>
-      <span class="page-sub">Supabase Realtime · fallback polling เมื่อการเชื่อมต่อขัดข้อง</span></div>
+      <span class="page-sub">FastAPI WebSocket · fallback polling เมื่อการเชื่อมต่อขัดข้อง</span></div>
     <div class="cols cols-filter-main">
       <div class="stack">
         ${filterCard(['province', 'project', 'plan'])}
@@ -1340,8 +1340,12 @@ function renderLiveSnapshot(live, channel) {
   if (S.live.stopped) return;
   const plan = $('#live-plan');
   if (!plan) return stopLive();
-  const tags = Object.entries(live.tags || {}).map(([id, tag]) =>
-    Object.assign({ tag_id: id, label: tag.sale_name || id }, tag));
+  const tags = Object.entries(live.tags || {})
+    .filter(([_id, tag]) => !S.live.projectId
+      || !tag.project_id
+      || String(tag.project_id) === String(S.live.projectId))
+    .map(([id, tag]) =>
+      Object.assign({ tag_id: id, label: tag.sale_name || id }, tag));
   plan.innerHTML = planSVG({ ...(S.live.planDrawing || {}), tags, anchorStatus: S.live.anchorStatus || {} });
   const count = $('#live-tag-count');
   if (count) count.textContent = `${tags.filter(tag => tag.on).length} / ${tags.length}`;
@@ -1372,11 +1376,11 @@ async function pollLiveFallback() {
   S.live.pollAbort = controller;
   try {
     const live = await requestApi(projectPath('/api/live?rows=0', S.live.projectId), { signal: controller.signal });
-    if (S.live.fallbackActive && !S.live.realtimeConnected) {
+    if (S.live.fallbackActive && S.live.socket?.readyState !== 1) {
       renderLiveSnapshot(live, 'Polling fallback');
     }
   } catch (_error) {
-    // The Realtime reconnect loop remains active; a failed fallback request
+    // The WebSocket reconnect loop remains active; a failed fallback request
     // should not interrupt the rest of the dashboard.
   } finally {
     if (S.live.pollAbort === controller) S.live.pollAbort = null;
@@ -1407,63 +1411,70 @@ function scheduleLiveReconnect() {
   if (S.live.stopped || S.live.reconnectTimer) return;
   S.live.reconnectTimer = setTimeout(() => {
     S.live.reconnectTimer = null;
-    connectLiveRealtime();
+    connectLiveWebSocket();
   }, LIVE_RECONNECT_MS);
 }
 
-function queueRealtimeRefresh() {
-  if (S.live.stopped || S.live.refreshTimer) return;
-  S.live.refreshTimer = setTimeout(async () => {
-    S.live.refreshTimer = null;
-    try {
-      const live = await requestApi(projectPath('/api/live?rows=0', S.live.projectId));
-      if (S.live.realtimeConnected) renderLiveSnapshot(live, 'Supabase Realtime');
-    } catch (_error) {
-      startFallbackPolling();
-    }
-  }, 100);
-}
-
-function connectLiveRealtime() {
+function connectLiveWebSocket() {
   if (S.live.stopped || !S.token) return;
-  if (!supabaseClient) {
+  if (typeof WebSocket === 'undefined') {
     startFallbackPolling();
     return;
   }
-  if (S.live.channel) return;
+  const active = S.live.socket;
+  if (active && (active.readyState === WebSocket.OPEN || active.readyState === WebSocket.CONNECTING)) return;
 
-  const change = { event: '*', schema: 'public', table: 'tags' };
-  if (S.live.projectId) change.filter = `project_id=eq.${S.live.projectId}`;
-  const channel = supabaseClient
-    .channel(`uwb-live-${Date.now()}`)
-    .on('postgres_changes', change, queueRealtimeRefresh);
-  S.live.channel = channel;
+  let socket;
+  try {
+    socket = new WebSocket(websocketUrl('/ws/live'), [
+      'supalai.live',
+      `session.${S.token}`,
+    ]);
+  } catch (_error) {
+    startFallbackPolling();
+    scheduleLiveReconnect();
+    return;
+  }
+  S.live.socket = socket;
   S.live.connectTimer = setTimeout(() => {
-    if (!S.live.realtimeConnected && S.live.channel === channel) {
+    if (socket.readyState === WebSocket.CONNECTING) {
       startFallbackPolling();
-      void supabaseClient.removeChannel(channel);
-      S.live.channel = null;
-      scheduleLiveReconnect();
+      socket.close();
     }
   }, LIVE_RECONNECT_MS);
-  channel.subscribe(status => {
-    if (S.live.channel !== channel || S.live.stopped) return;
-    if (status === 'SUBSCRIBED') {
-      S.live.realtimeConnected = true;
-      if (S.live.connectTimer) {
-        clearTimeout(S.live.connectTimer);
-        S.live.connectTimer = null;
+
+  socket.onopen = () => {
+    if (S.live.socket !== socket || S.live.stopped) return socket.close();
+    if (S.live.connectTimer) {
+      clearTimeout(S.live.connectTimer);
+      S.live.connectTimer = null;
+    }
+    stopFallbackPolling();
+  };
+  socket.onmessage = event => {
+    if (S.live.socket !== socket || S.live.stopped) return;
+    try {
+      const message = JSON.parse(event.data);
+      if ((message.type === 'snapshot' || message.type === 'tags') && message.tags) {
+        renderLiveSnapshot(message, 'WebSocket');
       }
-      stopFallbackPolling();
-      queueRealtimeRefresh();
-    } else if (['CHANNEL_ERROR', 'TIMED_OUT', 'CLOSED'].includes(status)) {
-      S.live.realtimeConnected = false;
-      S.live.channel = null;
+    } catch (_error) { /* ignore malformed frames and keep the channel alive */ }
+  };
+  socket.onerror = () => {
+    if (S.live.socket === socket && !S.live.stopped) startFallbackPolling();
+  };
+  socket.onclose = () => {
+    if (S.live.socket !== socket) return;
+    S.live.socket = null;
+    if (S.live.connectTimer) {
+      clearTimeout(S.live.connectTimer);
+      S.live.connectTimer = null;
+    }
+    if (!S.live.stopped) {
       startFallbackPolling();
-      void supabaseClient.removeChannel(channel);
       scheduleLiveReconnect();
     }
-  });
+  };
 }
 
 function startLive(projectId = selectedProjectId()) {
@@ -1473,8 +1484,7 @@ function startLive(projectId = selectedProjectId()) {
   S.live.anchorStatus = S.live.anchorStatus || {};
   S.live.fallbackActive = false;
   S.live.pollInFlight = false;
-  S.live.realtimeConnected = false;
-  connectLiveRealtime();
+  connectLiveWebSocket();
 }
 
 function stopLive() {
@@ -1488,14 +1498,9 @@ function stopLive() {
     clearTimeout(S.live.connectTimer);
     S.live.connectTimer = null;
   }
-  if (S.live.refreshTimer) {
-    clearTimeout(S.live.refreshTimer);
-    S.live.refreshTimer = null;
-  }
-  const channel = S.live.channel;
-  S.live.channel = null;
-  S.live.realtimeConnected = false;
-  if (channel && supabaseClient) void supabaseClient.removeChannel(channel);
+  const socket = S.live.socket;
+  S.live.socket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'Live view stopped');
 }
 
 /* --------------------------------------------------------------- plumbing */

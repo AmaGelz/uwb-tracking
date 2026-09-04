@@ -1,8 +1,7 @@
 -- =========================================================
--- SUPALAI-UWB — PostgreSQL / Supabase schema
+-- SUPALAI-UWB — PostgreSQL schema
 -- =========================================================
--- Run once against your Supabase project (SQL editor, or via
--- migration/migration.py). Safe to re-run: everything uses
+-- Apply through migration/migration.py. Safe to re-run: everything uses
 -- IF NOT EXISTS / OR REPLACE.
 --
 -- Design notes
@@ -16,6 +15,13 @@
 -- - zones/anchors/positions are project-scoped so more than one
 --   project can be tracked independently.
 -- =========================================================
+
+-- Keep the dashboard isolated from the pre-existing UWB application's
+-- tables in public.  The API connects with the same search_path, so all
+-- unqualified application queries resolve here first while legacy readers
+-- may still address public.* explicitly.
+create schema if not exists supalai_dashboard;
+set search_path to supalai_dashboard, public;
 
 create extension if not exists pgcrypto;
 
@@ -190,6 +196,29 @@ create index if not exists idx_tag_assignments_employee_active
     on tag_assignments(employee_id, tag_id)
     where ended_at is null;
 
+-- Stable identifiers used by the optional bridge from the pre-existing UWB
+-- application's public schema.  Keeping this mapping in the dashboard schema
+-- lets the bridge resume without guessing whether a numeric legacy tag is the
+-- physical device or a simulator record.
+create table if not exists legacy_tag_map (
+    legacy_tag_id          integer primary key,
+    dashboard_tag_id       text unique not null references tags(tag_id) on delete cascade,
+    dashboard_project_id   text not null references projects(id) on delete cascade,
+    source                 text not null check (source in ('hardware', 'simulator')),
+    created_at             timestamptz not null default now(),
+    updated_at             timestamptz not null default now()
+);
+create index if not exists idx_legacy_tag_map_project
+    on legacy_tag_map(dashboard_project_id, source);
+
+-- One row per tailed legacy stream.  A bridge commits its source cursor only
+-- after the corresponding dashboard rows have been committed.
+create table if not exists legacy_import_state (
+    source       text primary key,
+    last_id      bigint not null default 0 check (last_id >= 0),
+    updated_at   timestamptz not null default now()
+);
+
 -- Backfill legacy tags exactly once. Checking for any history (rather than
 -- merely an active row) prevents a later schema re-run from resurrecting an
 -- assignment that an administrator intentionally ended.
@@ -251,10 +280,8 @@ alter table positions
     add column if not exists anchors_used integer;
 
 -- Recover project/plan/source metadata for rows written by the legacy API.
--- One pass, not four: on Supabase this table is REPLICA IDENTITY FULL and
--- published to Realtime, so each UPDATE ships both tuples to WAL and repeated
--- passes rewrite every row again. Plan comes from the tag's project so the
--- whole recovery stays a single statement.
+-- Use one pass to avoid repeatedly rewriting position history. Plan comes from
+-- the tag's project so the whole recovery stays a single statement.
 update positions pos
 set project_id = coalesce(pos.project_id, tag.project_id),
     plan_id    = coalesce(pos.plan_id, project.plan_id),
@@ -431,10 +458,10 @@ create index if not exists idx_notes_visit on notes(visit_key);
 -- Audit timestamps and atomic hardware ingestion
 -- ---------------------------------------------------------
 
-create or replace function public.set_updated_at()
+create or replace function supalai_dashboard.set_updated_at()
 returns trigger
 language plpgsql
-set search_path = public, pg_temp
+set search_path = supalai_dashboard, pg_temp
 as $$
 begin
     new.updated_at := now();
@@ -445,23 +472,23 @@ $$;
 drop trigger if exists projects_set_updated_at on projects;
 create trigger projects_set_updated_at
 before update on projects
-for each row execute function public.set_updated_at();
+for each row execute function supalai_dashboard.set_updated_at();
 
 drop trigger if exists tags_set_updated_at on tags;
 create trigger tags_set_updated_at
 before update on tags
-for each row execute function public.set_updated_at();
+for each row execute function supalai_dashboard.set_updated_at();
 
 drop trigger if exists gateway_credentials_set_updated_at on gateway_credentials;
 create trigger gateway_credentials_set_updated_at
 before update on gateway_credentials
-for each row execute function public.set_updated_at();
+for each row execute function supalai_dashboard.set_updated_at();
 
 -- This RPC is called only after the Edge ingest endpoint verifies the signed
 -- gateway request. It repeats the authoritative database checks and writes a
 -- position, tag snapshot and visit atomically. A repeated gateway/message pair
 -- returns the existing position without changing snapshot or visit state.
-create or replace function public.ingest_uwb_fix(
+create or replace function supalai_dashboard.ingest_uwb_fix(
     p_gateway_id     text,
     p_message_id     text,
     p_tag_id         text,
@@ -478,7 +505,7 @@ create or replace function public.ingest_uwb_fix(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = supalai_dashboard, pg_temp
 as $$
 declare
     v_tag_type       text;
@@ -645,30 +672,18 @@ begin
 end;
 $$;
 
-revoke all on function public.ingest_uwb_fix(
+revoke all on function supalai_dashboard.ingest_uwb_fix(
     text, text, text, text, text, timestamptz,
     double precision, double precision, text, double precision,
     double precision, integer
 ) from public;
 
-do $$
-begin
-    if exists (select 1 from pg_roles where rolname = 'service_role') then
-        execute 'grant execute on function public.ingest_uwb_fix(text, text, text, text, text, timestamptz, double precision, double precision, text, double precision, double precision, integer) to service_role';
-    end if;
-end
-$$;
-
 -- ---------------------------------------------------------
 -- Row Level Security
 -- ---------------------------------------------------------
--- The API talks to Postgres with a direct connection (service-role
--- level access — see backend/.env), which bypasses RLS by design:
--- all access control (who can see whose visits, who can edit) is
--- enforced in backend/backend/main.py. RLS is enabled with no
--- policies attached, so if anyone ever points supabase-js's
--- anon/authenticated client at this project directly, every table
--- here returns zero rows instead of leaking data.
+-- FastAPI connects with the database owner configured in backend/.env, which
+-- bypasses RLS. Authentication and application data scope are enforced in
+-- backend/backend/main.py. No browser-facing database role receives policies.
 -- ---------------------------------------------------------
 
 alter table users     enable row level security;
@@ -678,6 +693,8 @@ alter table zones     enable row level security;
 alter table anchors   enable row level security;
 alter table tags      enable row level security;
 alter table tag_assignments enable row level security;
+alter table legacy_tag_map enable row level security;
+alter table legacy_import_state enable row level security;
 alter table gateway_credentials enable row level security;
 alter table positions enable row level security;
 alter table customers enable row level security;

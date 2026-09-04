@@ -12,7 +12,7 @@ contract for connecting real anchors is implemented.
 3. The gateway posts the reading to the hardware ingest endpoint.
 4. The backend authenticates the gateway, resolves the tag position, and
    writes the position, live tag snapshot, and visit state to PostgreSQL.
-5. Supabase Realtime updates the dashboard.
+5. The FastAPI WebSocket updates the dashboard.
 
 Real hardware and demo traffic are isolated by project. A real deployment uses
 a project with `tracking_mode=hardware`; mock tags remain in separate projects
@@ -34,10 +34,10 @@ history.
 
 ## Send ranges
 
-Production Supabase endpoint:
+FastAPI endpoint:
 
 ```text
-POST https://jitmnaljkughkhmxeaov.supabase.co/functions/v1/uwb-ingest
+POST https://<fastapi-host>/api/uwb/ingest
 X-Gateway-Id: GW-P900-01
 X-Gateway-Key: <key shown when the gateway was created>
 Content-Type: application/json
@@ -68,10 +68,9 @@ seconds, epoch milliseconds, or ISO-8601; when omitted, server receipt time is
 used. Readings more than 15 minutes old or more than five minutes in the future
 are rejected.
 
-The local FastAPI equivalent is `POST http://127.0.0.1:8000/api/uwb/ingest`
-with the same gateway headers and payload. Do not send real hardware to
+For local development, use `POST http://127.0.0.1:8000/api/uwb/ingest`.
+Do not send real hardware to
 `/api/positioning/{project_id}/ingest`; that authenticated route is reserved
 for mock/bench data in simulation projects.
 
-See `../../supabase/README.md` and `../../backend/README.md` for deployment and
-the complete backend setup.
+See `../../backend/README.md` for deployment and the complete backend setup.

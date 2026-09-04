@@ -13,23 +13,30 @@ from config import settings
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCHEMA_SQL = REPO_ROOT / "database" / "schema.sql"
 SEED_SQL = REPO_ROOT / "database" / "seed.sql"
+MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
+APP_SCHEMA = "supalai_dashboard"
 
 
 class Database:
     """Thin Postgres access layer.
 
-    Talks to Supabase's Postgres (or any Postgres) directly over the
-    wire via psycopg2 rather than through the PostgREST/supabase-py
-    client, because several endpoints here (analytics, dwell-time,
-    visit funnels) need real joins/aggregations that are awkward to
-    express through a REST-table client. A small connection pool
-    keeps this fast against a hosted database where every new TCP+TLS
-    connection has real latency.
+    Talks directly to PostgreSQL over psycopg2. Several endpoints
+    (analytics, dwell-time and visit funnels) use joins/aggregations, and a
+    small connection pool avoids opening a new TCP connection per request.
     """
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self._pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=dsn)
+        # The connected database already contains the legacy UWB application's
+        # public tables.  Keep this dashboard isolated while still allowing
+        # explicitly-qualified reads from ``public`` for the compatibility
+        # bridge.
+        self._pool = psycopg2.pool.ThreadedConnectionPool(
+            1,
+            10,
+            dsn=dsn,
+            options=f"-c search_path={APP_SCHEMA},public",
+        )
 
     @contextmanager
     def _conn(self):
@@ -95,3 +102,16 @@ def seed_demo_data() -> None:
     if not text:
         return
     db.script(text)
+
+
+def apply_migrations() -> None:
+    """Apply every versioned SQL migration in filename order.
+
+    The migration files are written to be idempotent, so startup can safely
+    ensure plan-editor and legacy-import structures exist without maintaining
+    a second schema-version mechanism.
+    """
+    if not MIGRATIONS_DIR.exists():
+        return
+    for migration_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        db.script(migration_file.read_text(encoding="utf-8"))

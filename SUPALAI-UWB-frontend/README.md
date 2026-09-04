@@ -7,24 +7,24 @@ Files:
 - login.html: original-style Sign In
 - dashboard.html: dashboard shell + hash-routed screens
 - css/style.css: original app(2).css moved without redesign
-- js/runtime-config.js: public Supabase URL/publishable key and Edge Function origin
-- js/api.js: Supabase session state + Edge Function transport
-- js/auth.js: Supabase password/invite/Google sign-in
+- js/runtime-config.js: optional public FastAPI origin
+- js/api.js: FastAPI session header and HTTP/WebSocket URL transport
+- js/auth.js: PostgreSQL-backed password and optional Google sign-in
 - js/app.js: original dashboard rendering/routing
 
-Production endpoints keep the existing `/api/...` contract through the
-Supabase Edge Function in `../supabase/functions/api`. The FastAPI backend is
-retained for local/legacy deployments.
+All endpoints use the `/api/...` contract served by the FastAPI backend.
+Live positions use `/ws/live`, with authenticated HTTP polling as a fallback.
 
 ## Production deployment
 
-Supabase provides Auth, Postgres, Realtime and the Edge Function API.
-Cloudflare Workers Static Assets serves the public frontend without requiring
-a Supabase custom-domain add-on.
+The simplest deployment is to let FastAPI serve this directory. Keep
+`apiBaseUrl` empty in `js/runtime-config.js`, run the backend, and open the
+FastAPI origin. HTTP, authentication and WebSocket traffic then remain
+same-origin.
 
-Deploy the Supabase services as described in `../supabase/README.md`, then
-deploy the repository's `wrangler.jsonc` configuration. The production URL is
-`https://supalai-uwb-tracking.ordinary-plant.workers.dev`.
+If the static frontend is hosted separately, set `apiBaseUrl` to the public
+HTTPS origin of FastAPI, add the frontend origin to `CORS_ORIGINS`, and make
+sure the reverse proxy supports WebSocket upgrades. Never put `DATABASE_URL`
+or a gateway key in a frontend file.
 
-If Google Sign-In is enabled, configure the Google provider in Supabase Auth
-and allow the production Cloudflare URL as a redirect URL.
+Optional Google Sign-In is verified by FastAPI using `GOOGLE_CLIENT_ID`.

@@ -45,8 +45,8 @@ to the hardware ingest endpoint:
 The gateway must authenticate with its project-scoped `X-Gateway-Id` and
 `X-Gateway-Key`. The backend rejects an unregistered/disabled tag, a mock tag,
 or a physical tag assigned to a different project. Once accepted, the result is
-stored in PostgreSQL and appears on the live dashboard through Supabase
-Realtime.
+stored in PostgreSQL and appears on the live dashboard through the FastAPI
+WebSocket.
 
 See `../anchor/README.md` for endpoints, headers, retry behavior, and the full
 gateway flow.
