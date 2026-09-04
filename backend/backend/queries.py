@@ -210,7 +210,8 @@ def create_invited_user(
 def get_projects() -> list[dict[str, Any]]:
     projects = db.fetchall(
         """
-        SELECT id AS project_id, name, province, plan_id, plan_name, width_m, height_m
+        SELECT id AS project_id, name, province, plan_id, plan_name, width_m, height_m,
+               tracking_mode
         FROM projects
         ORDER BY name
         """
@@ -1082,3 +1083,126 @@ def get_analytics(q: dict[str, str]) -> dict[str, Any]:
         "by_hour": by_hour,
         "by_weekday": by_weekday,
     }
+
+
+# ---------------------------------------------------------------------
+# Tracking policy support (mock/simulation vs physical/hardware)
+# ---------------------------------------------------------------------
+
+def get_project_tracking_mode(project_id: str) -> str | None:
+    row = db.fetchone("SELECT tracking_mode FROM projects WHERE id = %s", (project_id,))
+    return row["tracking_mode"] if row else None
+
+
+def get_active_plan(project_id: str) -> dict[str, Any] | None:
+    return db.fetchone(
+        """
+        SELECT id AS plan_id, project_id, name, width_m, height_m, is_active
+        FROM plans
+        WHERE project_id = %s
+        ORDER BY is_active DESC, id DESC
+        LIMIT 1
+        """,
+        (project_id,),
+    )
+
+
+def get_tracking_tag(tag_id: str) -> dict[str, Any] | None:
+    """Small tag record used by ingest policy checks."""
+    return db.fetchone(
+        """
+        SELECT tag_id, employee_id, project_id, tag_type, status, x, y, battery, last_ts
+        FROM tags
+        WHERE tag_id = %s
+        """,
+        (tag_id,),
+    )
+
+
+def get_position_by_message_id(gateway_id: str, message_id: str) -> dict[str, Any] | None:
+    # positions has no gateway_id column here; real hardware fixes dedupe
+    # through hardware_ingest_receipts(device_id, message_id) on the
+    # existing /api/hardware/ingest path instead. Only the simulator reaches
+    # this function, and it never sets message_id, so this is always a miss.
+    if not message_id:
+        return None
+    return db.fetchone(
+        """
+        SELECT tag_id, project_id, plan_id, x, y, zone, source, ts
+        FROM positions
+        WHERE device_id = %s AND message_id = %s
+        """,
+        (gateway_id, message_id),
+    )
+
+
+def record_position_fix(
+    *,
+    tag_id: str,
+    employee_id: str | None,
+    project_id: str,
+    plan_id: str | None,
+    x: float,
+    y: float,
+    zone: str | None,
+    source: str,
+    gateway_id: str | None,
+    message_id: str | None,
+    device_ts: datetime | None,
+    residual_m: float | None,
+    anchors_used: int | None,
+    battery: float | None,
+    ts: datetime,
+    visit_key: str,
+) -> dict[str, Any] | None:
+    """Persist a fix, live tag state, and a newly opened visit.
+
+    positions/visits here have no gateway_id, device_ts or visits.source
+    columns, and no dedupe index on this path (that lives on
+    hardware_ingest_receipts instead). This function is only ever reached
+    from the simulator, which never repeats a message_id, so it is a plain
+    insert with no ON CONFLICT. ``device_ts`` is accepted for interface
+    compatibility with ``tracking.ingest_fix`` but not persisted.
+    """
+    return db.fetchone(
+        """
+        WITH inserted_position AS (
+            INSERT INTO positions (
+                tag_id, project_id, plan_id, x, y, zone, source,
+                device_id, message_id, residual_m, anchors_used, ts
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        ), updated_tag AS (
+            UPDATE tags AS t
+            SET x = p.x,
+                y = p.y,
+                battery = COALESCE(%s, t.battery),
+                last_ts = p.ts
+            FROM inserted_position AS p
+            WHERE t.tag_id = p.tag_id
+              AND (t.last_ts IS NULL OR t.last_ts <= p.ts)
+            RETURNING t.tag_id
+        ), opened_visit AS (
+            INSERT INTO visits (
+                visit_key, tag_id, employee_id, project_id, plan_id,
+                started_at, deal_status
+            )
+            SELECT %s, p.tag_id, %s, p.project_id, p.plan_id, p.ts, ''
+            FROM inserted_position AS p
+            WHERE NOT EXISTS (
+                SELECT 1 FROM visits AS v
+                WHERE v.tag_id = p.tag_id AND v.ended_at IS NULL
+            )
+            RETURNING visit_key
+        )
+        SELECT p.*, (SELECT visit_key FROM opened_visit) AS opened_visit_key
+        FROM inserted_position AS p
+        """,
+        (
+            tag_id, project_id, plan_id, x, y, zone, source,
+            gateway_id, message_id, residual_m, anchors_used, ts,
+            battery,
+            visit_key, employee_id,
+        ),
+    )

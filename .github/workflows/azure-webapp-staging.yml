@@ -1,0 +1,60 @@
+name: Build and deploy staging web app
+
+on:
+  push:
+    branches:
+      - feat/tracking-on-login
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uwbtrackingtest-staging
+  cancel-in-progress: true
+
+env:
+  # A separate Web App, not a slot of uwbtrackingtest: the App Service Plan
+  # backing uwbtrackingtest is Free/Basic tier, which does not support
+  # deployment slots. A standalone Free-tier app gets us the same "click
+  # through a real Azure URL before merging" result without an upgrade.
+  AZURE_WEBAPP_NAME: uwbtrackingtest-staging
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies and validate build
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m compileall -q backend/backend
+          python -m pytest tests/ --ignore=tests/test_mailer.py -q
+
+      - name: Create clean deployment package
+        run: git archive --format=zip --output="release-${GITHUB_SHA}.zip" HEAD
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_STAGING }}
+          package: release-${{ github.sha }}.zip
+
+      - name: Verify deployed application
+        run: |
+          curl --fail --silent --show-error \
+            --retry 24 --retry-delay 10 --retry-all-errors \
+            "https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/health"

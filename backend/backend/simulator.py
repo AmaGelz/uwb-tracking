@@ -47,12 +47,9 @@ class Simulator:
     visit history, and analytics have real, moving data to show without
     physical UWB hardware connected.
 
-    Disable with SIMULATOR_ENABLED=false in backend/.env once real
-    anchors/tags are wired up. Real fixes come in through
-    POST /api/positioning/{project_id}/ingest instead, which goes through
-    the exact same tracking.ingest_fix() path this simulator uses — so
-    turning this off and pointing real hardware at that endpoint is a
-    drop-in swap, not a rewrite.
+    The simulator selects only mock tags in simulation projects, so it can run
+    alongside real hardware projects. Physical tag fixes enter through
+    POST /api/uwb/ingest; both sources use the same tracking.ingest_fix() path.
     """
 
     def __init__(self) -> None:
@@ -83,13 +80,27 @@ class Simulator:
     def _tick_once(self) -> None:
         self._tick += 1
 
-        tag_rows = db.fetchall("SELECT tag_id, project_id FROM tags WHERE project_id IS NOT NULL")
+        tag_rows = db.fetchall(
+            """
+            SELECT t.tag_id, t.project_id
+            FROM tags AS t
+            JOIN projects AS p ON p.id = t.project_id
+            WHERE t.project_id IS NOT NULL
+              AND t.status = 'active'
+              AND t.tag_type = 'mock'
+              AND p.tracking_mode = 'simulation'
+            """
+        )
+        eligible_tag_ids = {row["tag_id"] for row in tag_rows}
+        for stale_tag_id in set(self._states) - eligible_tag_ids:
+            self._states.pop(stale_tag_id, None)
+
         for row in tag_rows:
             tag_id, project_id = row["tag_id"], row["project_id"]
             zones = q.get_zones(project_id)
 
             state = self._states.get(tag_id)
-            if state is None:
+            if state is None or state.project_id != project_id:
                 start = _pick_target(zones)
                 state = TagState(tag_id=tag_id, project_id=project_id, x=start[0], y=start[1])
                 self._states[tag_id] = state
@@ -107,15 +118,33 @@ class Simulator:
                     and random.random() < 1 / 8):
                 state.target = _pick_target(zones)
 
-            tracking.ingest_fix(tag_id, round(state.x, 3), round(state.y, 3))
+            try:
+                tracking.ingest_fix(
+                    tag_id,
+                    round(state.x, 3),
+                    round(state.y, 3),
+                    project_id=project_id,
+                    source="simulator",
+                )
+            except tracking.TrackingPolicyError as exc:
+                # The tag stopped being simulator-owned between the query above
+                # and this write — an admin retyped it or switched the project
+                # to hardware. That is the policy working, not a loop failure,
+                # so drop this tag and keep the rest of the demo moving.
+                # Without this, the exception would escape _tick_once and end
+                # _run's loop for good (start() will not restart a finished task).
+                logger.info("simulator skipping %s: %s", tag_id, exc)
+                self._states.pop(tag_id, None)
+                continue
 
             state.present_ticks_left -= 1
             if state.present_ticks_left <= 0:
                 state.present = False
 
-        # Anchor heartbeats — keeps the seeded anchors showing "online" in /api/devices.
+        # Only simulated projects get synthetic anchor heartbeats. Hardware
+        # projects must stay offline until their real gateway reports.
         for p in q.get_projects():
-            if q.get_anchors(p["project_id"]):
+            if p["tracking_mode"] == "simulation" and q.get_anchors(p["project_id"]):
                 q.touch_anchors(p["project_id"])
 
         if self._tick % 5 == 0:
